@@ -1,7 +1,8 @@
 import asyncio
 import os
+import re
 import tempfile
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import dateparser.search
 from dotenv import load_dotenv
@@ -27,22 +28,144 @@ def is_owner(update: Update) -> bool:
 
 def pick_emoji(text: str) -> str:
     t = text.lower()
-    if any(w in t for w in ("тренировка", "спорт", "зал", "бег", "йога", "фитнес")):
+    if any(w in t for w in ("трен", "спорт", "зал", "бег", "йога", "фитнес", "качал", "штанг")):
         return "🏋"
     if any(w in t for w in ("еда", "завтрак", "обед", "ужин", "кафе", "ресторан", "покушать", "поесть")):
         return "🍽"
-    if any(w in t for w in ("встреча", "встретиться", "встретить")):
+    if any(w in t for w in ("встреча", "встретиться", "встретить", "свидан")):
         return "🤝"
-    if any(w in t for w in ("работа", "задача", "чат", "бот", "код", "программ", "разработка", "созвон", "звонок")):
+    if any(w in t for w in ("работа", "задача", "чат", "бот", "код", "программ", "разработка", "созвон", "звонок", "позвонить")):
         return "💻"
     return "📌"
 
 
+# Служебные слова, которые человек говорит вокруг задачи, но в списке они не нужны.
+FILLER_WORDS = {
+    "запланируй", "запланировать", "напомни", "напомнить", "поставь", "поставить",
+    "добавь", "добавить", "создай", "создать", "запиши", "записать", "сделай",
+    "надо", "нужно", "мне", "себе", "пожалуйста", "плиз",
+}
+
+# Слова-даты: для нашего «однодневного» бота в названии задачи они не нужны.
+DATE_WORDS = {
+    "сегодня", "завтра", "послезавтра", "сейчас", "нынче", "утром", "днём", "днем",
+    "вечером", "ночью", "понедельник", "вторник", "среду", "четверг", "пятницу",
+    "субботу", "воскресенье",
+}
+
+# Предлоги, которые отрезаем по краям задачи (в середине не трогаем — «позвонить в банк»).
+EDGE_PREPOSITIONS = {"на", "в", "о", "об", "про", "к"}
+
+# Нормализация частых разговорных сокращений до нормального вида.
+ABBREVIATIONS = {
+    "треню": "тренировка", "треня": "тренировка", "тренька": "тренировка",
+    "тренеровка": "тренировка", "трени": "тренировка",
+}
+
+# Части суток для пересчёта «7 вечера» → 19:00 и т.п.
+def _apply_part_of_day(hour: int, part: str) -> int:
+    if part.startswith("веч"):                       # вечера → +12
+        return hour + 12 if hour < 12 else hour
+    if part.startswith("дн") or part.startswith("дня"):  # дня → +12 (кроме 12)
+        return hour + 12 if hour < 12 else hour
+    if part.startswith("ноч"):                       # 12 ночи → 0
+        return 0 if hour == 12 else hour
+    if part.startswith("утр"):                       # 12 утра → 0
+        return 0 if hour == 12 else hour
+    return hour
+
+
+def extract_time(text: str):
+    """
+    Достаёт время из русской фразы. Возвращает (hour, minute, (start, end))
+    с координатами найденного куска или None. Регистр не важен (длина строки
+    при .lower() не меняется, поэтому координаты подходят и к оригиналу).
+    """
+    t = text.lower()
+
+    # «через N часов / N минут» — относительное время от текущего момента
+    # (\w* доедает окончание слова: час/часа/часов, мин/минут)
+    m = re.search(r"через\s+(\d{1,2})\s*час\w*", t)
+    if m:
+        base = datetime.now() + timedelta(hours=int(m.group(1)))
+        return base.hour, base.minute, m.span()
+    m = re.search(r"через\s+(\d{1,3})\s*мин\w*", t)
+    if m:
+        base = datetime.now() + timedelta(minutes=int(m.group(1)))
+        return base.hour, base.minute, m.span()
+
+    # Явное ЧЧ:ММ или ЧЧ.ММ
+    m = re.search(r"\b(\d{1,2})[:.](\d{2})\b", t)
+    if m and int(m.group(1)) < 24 and int(m.group(2)) < 60:
+        return int(m.group(1)), int(m.group(2)), m.span()
+
+    # «N [часов] утра/дня/вечера/ночи» — с частью суток
+    m = re.search(r"\b(\d{1,2})\s*(?:час(?:ов|а)?\s*)?(утра|утром|дня|днём|днем|вечера|вечером|ночи|ночью)\b", t)
+    if m and int(m.group(1)) <= 23:
+        return _apply_part_of_day(int(m.group(1)), m.group(2)) % 24, 0, m.span()
+
+    # «N часов» — 24-часовой формат без части суток
+    m = re.search(r"\b(\d{1,2})\s*час(?:ов|а)?\b", t)
+    if m and int(m.group(1)) < 24:
+        return int(m.group(1)), 0, m.span()
+
+    # «в N» — голое «в 8», «встреча в 9» (трактуем как N:00). Самый общий случай — в конце.
+    m = re.search(r"\bв\s+(\d{1,2})\b", t)
+    if m and int(m.group(1)) < 24:
+        return int(m.group(1)), 0, m.span()
+
+    # Полдень / полночь
+    m = re.search(r"полдень|полдня", t)
+    if m:
+        return 12, 0, m.span()
+    m = re.search(r"полноч", t)
+    if m:
+        return 0, 0, m.span()
+
+    return None
+
+
+def clean_task_text(text: str) -> str:
+    """
+    Превращает разговорную фразу в короткую задачу:
+    убирает служебные слова, слова-даты и краевые предлоги, нормализует
+    сокращения, ставит заглавную букву. 'запланируй на завтра треню' → 'Тренировка'.
+    """
+    words = []
+    for word in text.split():
+        bare = word.lower().strip(".,!?;:")
+        if bare in FILLER_WORDS or bare in DATE_WORDS:
+            continue  # выкидываем «запланируй», «завтра» и т.п.
+        words.append(ABBREVIATIONS.get(bare, word))
+
+    # Отрезаем предлоги по краям («на тренировка», «встреча в» → ...).
+    while words and words[0].lower().strip(".,!?;:") in EDGE_PREPOSITIONS:
+        words.pop(0)
+    while words and words[-1].lower().strip(".,!?;:") in EDGE_PREPOSITIONS:
+        words.pop()
+
+    cleaned = " ".join(words).strip(" ,.-—")
+    if cleaned:
+        cleaned = cleaned[0].upper() + cleaned[1:]
+    return cleaned
+
+
 def parse_task_from_text(text: str):
     """
-    Ищет дату/время в произвольном тексте через dateparser.
+    Достаёт время и текст задачи из произвольной фразы.
     Возвращает (datetime, текст_задачи) или (None, исходный_текст) если время не найдено.
+    Сначала пробуем свой надёжный экстрактор, затем dateparser как запасной вариант.
     """
+    found = extract_time(text)
+    if found is not None:
+        hour, minute, (start, end) = found
+        dt = datetime.now().replace(hour=hour, minute=minute, second=0, microsecond=0)
+        task_text = clean_task_text(text[:start] + " " + text[end:])
+        if not task_text:
+            task_text = clean_task_text(text)
+        return dt, task_text
+
+    # Запасной путь: вдруг dateparser поймёт что-то нестандартное.
     results = dateparser.search.search_dates(
         text,
         languages=["ru"],
@@ -51,12 +174,13 @@ def parse_task_from_text(text: str):
     if not results:
         return None, text
 
-    # Берём первое найденное совпадение
-    matched_str, dt = results[0]
-    # Убираем найденную строку с временем из текста задачи
-    task_text = text.replace(matched_str, "").strip(" ,.-—")
+    dt = results[0][1]
+    task_text = text
+    for matched_str, _ in results:
+        task_text = task_text.replace(matched_str, " ")
+    task_text = clean_task_text(task_text)
     if not task_text:
-        task_text = text  # если весь текст — это время, оставляем оригинал как задачу
+        task_text = clean_task_text(text)
     return dt, task_text
 
 
@@ -82,7 +206,7 @@ async def process_free_text(update: Update, context, raw_text: str):
     emoji = pick_emoji(task_text)
     if scheduled:
         await update.message.reply_text(
-            f"✅ Понял! Напомню:\n<code>{time_str}</code>  {emoji} {task_text}",
+            f"✅ Понял! Напомню:\n{emoji} {task_text} <code>в {time_str}</code>",
             parse_mode="HTML",
         )
     else:
@@ -158,7 +282,7 @@ async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines = ["📋 <b>Твоё расписание на сегодня:</b>\n"]
     for r in reminders:
         emoji = pick_emoji(r["text"])
-        lines.append(f"<code>{r['remind_at']}</code>  {emoji} {r['text']}")
+        lines.append(f"{emoji} {r['text']} <code>в {r['remind_at']}</code>")
 
     await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 
