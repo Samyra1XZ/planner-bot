@@ -4,30 +4,18 @@ import tempfile
 from datetime import datetime
 
 import dateparser.search
-import whisper
 from dotenv import load_dotenv
-from pydub import AudioSegment
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 
 from database import init_db, add_reminder, get_active_reminders, mark_done
 from scheduler import scheduler, schedule_reminder, reschedule_all
+from stt import transcribe
 
 # Загружаем переменные из файла .env (BOT_TOKEN, MY_CHAT_ID)
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 MY_CHAT_ID = int(os.getenv("MY_CHAT_ID"))
-
-# Размер модели Whisper для распознавания голоса.
-# "base" — лёгкая и быстрая, хватает на слабом железе (Railway/ноут).
-# На мощном VPS можно поменять на "small" или "medium" — точность выше.
-WHISPER_MODEL = "base"
-
-# Загружаем модель один раз при старте, а не на каждое сообщение —
-# загрузка занимает время, поэтому держим её в памяти.
-print(f"Загружаю модель Whisper '{WHISPER_MODEL}'... (первый запуск скачает её из интернета)")
-whisper_model = whisper.load_model(WHISPER_MODEL)
-print("Модель Whisper готова.")
 
 
 def is_owner(update: Update) -> bool:
@@ -210,7 +198,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Принимает голосовое сообщение:
-    скачивает .ogg → конвертирует в .wav → распознаёт локально через Whisper → обрабатывает как текст.
+    скачивает .ogg → распознаёт через stt.transcribe (Groq/Whisper) → обрабатывает как текст.
     """
     if not is_owner(update):
         return
@@ -222,27 +210,17 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     with tempfile.TemporaryDirectory() as tmpdir:
         ogg_path = os.path.join(tmpdir, "voice.ogg")
-        wav_path = os.path.join(tmpdir, "voice.wav")
-
         await voice_file.download_to_drive(ogg_path)
 
-        # Конвертируем .ogg (формат Telegram) в .wav — для этого нужен ffmpeg
-        AudioSegment.from_ogg(ogg_path).export(wav_path, format="wav")
-
-        # Распознаём речь локально через Whisper.
-        # transcribe — тяжёлая блокирующая операция, поэтому уносим её
-        # в отдельный поток, чтобы не подвешивать бота на время распознавания.
+        # Распознаём речь. transcribe — блокирующий вызов (сеть/CPU),
+        # поэтому уносим его в отдельный поток, чтобы не подвешивать бота.
         try:
-            result = await asyncio.to_thread(
-                whisper_model.transcribe, wav_path, language="ru"
-            )
+            text = await asyncio.to_thread(transcribe, ogg_path)
         except Exception:
             await update.message.reply_text(
                 "Не смог разобрать голос. Попробуй ещё раз или напиши текстом."
             )
             return
-
-    text = result["text"].strip()
 
     if not text:
         await update.message.reply_text(
