@@ -1,5 +1,9 @@
 .env
 .venv/
+venv/
 __pycache__/
 *.db
 *.pyc
+bot_err.txt
+bot_out.txt
+*.log
