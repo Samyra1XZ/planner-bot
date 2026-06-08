@@ -400,7 +400,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "<i>ДР мамы 20 августа</i>\n\n"
         "Если скажешь только дату — переспрошу время.\n\n"
         "Команды:\n"
-        "/list — задачи\n"
+        "/today — задачи на сегодня\n"
+        "/week — задачи на 7 дней вперёд\n"
         "/birthdays — дни рождения\n"
         "/add 15:00 текст — задача на сегодня\n"
         "/done 3 — отметить выполненной",
@@ -444,6 +445,94 @@ async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 
+# ───────────────────────── Вывод: названия и форматирование ──────────────────────────
+
+RU_WEEKDAYS = ["Понедельник", "Вторник", "Среда", "Четверг", "Пятница", "Суббота", "Воскресенье"]
+RU_MONTHS_GEN = [
+    "января", "февраля", "марта", "апреля", "мая", "июня",
+    "июля", "августа", "сентября", "октября", "ноября", "декабря",
+]
+
+
+def ru_day_month(d: date) -> str:
+    """Дата словами: '9 июня'."""
+    return f"{d.day} {RU_MONTHS_GEN[d.month - 1]}"
+
+
+def ru_date_header(d: date) -> str:
+    """Заголовок дня: 'Понедельник, 9 июня'."""
+    return f"{RU_WEEKDAYS[d.weekday()]}, {ru_day_month(d)}"
+
+
+def days_word(n: int) -> str:
+    """Склонение слова «день» под число: 1 день, 2 дня, 5 дней."""
+    n10, n100 = n % 10, n % 100
+    if n10 == 1 and n100 != 11:
+        return "день"
+    if 2 <= n10 <= 4 and not (12 <= n100 <= 14):
+        return "дня"
+    return "дней"
+
+
+def task_line(dt: datetime, text: str) -> str:
+    """Строка задачи в стиле v1.1: моноширинное время + эмодзи + текст."""
+    return f"<code>{dt:%H:%M}</code> {pick_emoji(text)} {text}"
+
+
+async def cmd_today(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update):
+        return
+
+    today = datetime.now(TZ).date()
+    rows = [
+        r for r in get_active_reminders()
+        if r["recurrence"] == "none" and datetime.fromisoformat(r["remind_at"]).date() == today
+    ]
+
+    if not rows:
+        await update.message.reply_text("✨ На сегодня пусто")
+        return
+
+    rows.sort(key=lambda r: r["remind_at"])  # ISO-строки сортируются по времени корректно
+    lines = ["📋 <b>Задачи на сегодня:</b>\n"]
+    for r in rows:
+        lines.append(task_line(datetime.fromisoformat(r["remind_at"]), r["text"]))
+
+    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+
+
+async def cmd_week(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update):
+        return
+
+    today = datetime.now(TZ).date()
+    end = today + timedelta(days=6)  # сегодня + 6 дней = 7 дней всего
+    rows = [
+        r for r in get_active_reminders()
+        if r["recurrence"] == "none"
+        and today <= datetime.fromisoformat(r["remind_at"]).date() <= end
+    ]
+
+    if not rows:
+        await update.message.reply_text("✨ На ближайшую неделю задач нет")
+        return
+
+    rows.sort(key=lambda r: r["remind_at"])
+    lines = []
+    current_day = None
+    for r in rows:
+        dt = datetime.fromisoformat(r["remind_at"])
+        d = dt.date()
+        if d != current_day:               # новый день → заголовок с датой
+            if lines:
+                lines.append("")           # пустая строка между днями
+            lines.append(f"📅 <b>{ru_date_header(d)}</b>")
+            current_day = d
+        lines.append(task_line(dt, r["text"]))
+
+    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+
+
 async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_owner(update):
         return
@@ -476,13 +565,36 @@ async def cmd_birthdays(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # Сортируем по месяцу и дню, чтобы шли по календарю.
-    bdays.sort(key=lambda r: datetime.fromisoformat(r["remind_at"]).strftime("%m-%d"))
+    today = datetime.now(TZ).date()
+
+    def next_occurrence(r) -> date:
+        """Ближайшая будущая дата этого ДР (в этом году или в следующем)."""
+        d = datetime.fromisoformat(r["remind_at"]).date()
+        for year in (today.year, today.year + 1):
+            try:
+                nxt = date(year, d.month, d.day)
+            except ValueError:           # 29 февраля в невисокосный год → 1 марта
+                nxt = date(year, 3, 1)
+            if nxt >= today:
+                return nxt
+        return today
+
+    # Ближайший по дате — сверху.
+    bdays.sort(key=next_occurrence)
 
     lines = ["🎂 <b>Дни рождения:</b>\n"]
-    for r in bdays:
+    for i, r in enumerate(bdays):
         d = datetime.fromisoformat(r["remind_at"]).date()
-        lines.append(f"🎂 {r['text']} — <code>{d.strftime('%d.%m')}</code>  #{r['id']}")
+        suffix = ""
+        if i == 0:  # «через N дней» считаем только до ближайшего
+            days = (next_occurrence(r) - today).days
+            if days == 0:
+                suffix = " (сегодня! 🎉)"
+            elif days == 1:
+                suffix = " (завтра)"
+            else:
+                suffix = f" (через {days} {days_word(days)})"
+        lines.append(f"<code>{ru_day_month(d)}</code> — {r['text']}{suffix}")
 
     await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 
@@ -579,6 +691,8 @@ if __name__ == "__main__":
     # Команды
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("add",   cmd_add))
+    app.add_handler(CommandHandler("today", cmd_today))
+    app.add_handler(CommandHandler("week",  cmd_week))
     app.add_handler(CommandHandler("list",  cmd_list))
     app.add_handler(CommandHandler("birthdays", cmd_birthdays))
     app.add_handler(CommandHandler("done",  cmd_done))
