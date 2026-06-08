@@ -1,0 +1,4 @@
+# Railway/Nixpacks: ставим ffmpeg в систему.
+# Он нужен и для конвертации .ogg→.wav (pydub), и для самого Whisper.
+[phases.setup]
+nixPkgs = ["ffmpeg"]

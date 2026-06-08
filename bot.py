@@ -1,9 +1,10 @@
+import asyncio
 import os
 import tempfile
 from datetime import datetime
 
 import dateparser.search
-import speech_recognition as sr
+import whisper
 from dotenv import load_dotenv
 from pydub import AudioSegment
 from telegram import Update
@@ -16,6 +17,17 @@ from scheduler import scheduler, schedule_reminder, reschedule_all
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 MY_CHAT_ID = int(os.getenv("MY_CHAT_ID"))
+
+# Размер модели Whisper для распознавания голоса.
+# "base" — лёгкая и быстрая, хватает на слабом железе (Railway/ноут).
+# На мощном VPS можно поменять на "small" или "medium" — точность выше.
+WHISPER_MODEL = "base"
+
+# Загружаем модель один раз при старте, а не на каждое сообщение —
+# загрузка занимает время, поэтому держим её в памяти.
+print(f"Загружаю модель Whisper '{WHISPER_MODEL}'... (первый запуск скачает её из интернета)")
+whisper_model = whisper.load_model(WHISPER_MODEL)
+print("Модель Whisper готова.")
 
 
 def is_owner(update: Update) -> bool:
@@ -69,8 +81,8 @@ async def process_free_text(update: Update, context, raw_text: str):
 
     if dt is None:
         await update.message.reply_text(
-            "Не понял время. Напиши в формате ЧЧ:ММ, например:\n"
-            "<i>встреча с клиентом в 15:00</i>",
+            "⏰ Не понял время. Напиши когда, например:\n"
+            "<i>завтра в 15:00 встреча с клиентом</i>",
             parse_mode="HTML",
         )
         return
@@ -198,7 +210,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Принимает голосовое сообщение:
-    скачивает .ogg → конвертирует в .wav → распознаёт через Google STT → обрабатывает как текст.
+    скачивает .ogg → конвертирует в .wav → распознаёт локально через Whisper → обрабатывает как текст.
     """
     if not is_owner(update):
         return
@@ -214,25 +226,32 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         await voice_file.download_to_drive(ogg_path)
 
-        # Конвертируем .ogg (формат Telegram) в .wav (формат SpeechRecognition)
+        # Конвертируем .ogg (формат Telegram) в .wav — для этого нужен ffmpeg
         AudioSegment.from_ogg(ogg_path).export(wav_path, format="wav")
 
-        recognizer = sr.Recognizer()
-        with sr.AudioFile(wav_path) as source:
-            audio_data = recognizer.record(source)
+        # Распознаём речь локально через Whisper.
+        # transcribe — тяжёлая блокирующая операция, поэтому уносим её
+        # в отдельный поток, чтобы не подвешивать бота на время распознавания.
+        try:
+            result = await asyncio.to_thread(
+                whisper_model.transcribe, wav_path, language="ru"
+            )
+        except Exception:
+            await update.message.reply_text(
+                "Не смог разобрать голос. Попробуй ещё раз или напиши текстом."
+            )
+            return
 
-    # Распознаём речь через Google (бесплатно, без API-ключа)
-    try:
-        text = recognizer.recognize_google(audio_data, language="ru-RU")
-    except sr.UnknownValueError:
-        await update.message.reply_text("Не смог разобрать голос. Попробуй ещё раз или напиши текстом.")
-        return
-    except sr.RequestError:
-        await update.message.reply_text("Ошибка связи с сервисом распознавания. Попробуй позже.")
+    text = result["text"].strip()
+
+    if not text:
+        await update.message.reply_text(
+            "Не смог разобрать голос. Попробуй ещё раз или напиши текстом."
+        )
         return
 
     # Показываем что распознали, потом обрабатываем как обычный текст
-    await update.message.reply_text(f"🗣 Распознал: <i>{text}</i>", parse_mode="HTML")
+    await update.message.reply_text(f"🎤 Распознал: <i>{text}</i>", parse_mode="HTML")
     await process_free_text(update, context, text)
 
 
