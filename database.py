@@ -105,6 +105,19 @@ def mark_done(reminder_id: int) -> bool:
     return updated
 
 
+def delete_reminder(reminder_id: int) -> bool:
+    """
+    Полностью удаляет напоминание из базы (в отличие от mark_done).
+    Возвращает True, если строка нашлась и удалилась.
+    """
+    conn = get_connection()
+    cursor = conn.execute("DELETE FROM reminders WHERE id = ?", (reminder_id,))
+    conn.commit()
+    deleted = cursor.rowcount > 0
+    conn.close()
+    return deleted
+
+
 def get_reminder_by_id(reminder_id: int):
     """Возвращает одно напоминание по id (или None, если не нашли)."""
     conn = get_connection()

@@ -5,11 +5,16 @@ import tempfile
 from datetime import datetime, timedelta, date
 
 from dotenv import load_dotenv
-from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    Application, CommandHandler, ContextTypes, MessageHandler, CallbackQueryHandler, filters,
+)
 
-from database import init_db, add_reminder, get_active_reminders, mark_done
-from scheduler import scheduler, schedule_reminder, reschedule_all, TZ
+from database import (
+    init_db, add_reminder, get_active_reminders, mark_done,
+    delete_reminder, get_reminder_by_id,
+)
+from scheduler import scheduler, schedule_reminder, reschedule_all, unschedule_reminder, TZ
 from stt import transcribe
 
 # Загружаем переменные из файла .env (BOT_TOKEN, MY_CHAT_ID)
@@ -323,11 +328,90 @@ async def _create_reminder(update, context, task, d: date, hm, recurrence, rolle
         )
 
 
+# ───────────────────────── Удаление по голосу/тексту ──────────────────────────
+
+# Намерение удалить: фраза начинается с такого слова.
+DELETE_RE = re.compile(
+    r"^\s*(удали(ть)?|удоли(ть)?|убери|убрать|сотри|стереть|отмени(ть)?|снеси|удол\w*)\b",
+    re.IGNORECASE,
+)
+
+# Слова, которые в запросе на удаление не относятся к названию задачи.
+DELETE_STOP_WORDS = {
+    "задачу", "задача", "задание", "напоминание", "напоминалку", "напоминалка",
+    "дело", "из", "списка", "список", "пожалуйста", "плиз", "это", "эту", "этот",
+    "мне", "мой", "мою", "про", "напоминалки",
+}
+
+
+def is_delete_intent(text: str) -> bool:
+    return bool(DELETE_RE.match(text))
+
+
+def find_matches(query: str):
+    """Ищет активные напоминания (задачи и ДР), чьё название похоже на запрос."""
+    qtokens = [
+        w for w in re.findall(r"[а-яёa-z0-9]+", query.lower())
+        if w not in DELETE_STOP_WORDS and w not in DATE_WORDS and len(w) >= 3
+    ]
+    if not qtokens:
+        return []
+
+    matches = []
+    for r in get_active_reminders():
+        ttokens = re.findall(r"[а-яёa-z0-9]+", r["text"].lower())
+        # совпадение по началу слова (4 буквы) — ловит «зал», «встречу»~«встреча» и т.п.
+        if any(any(tt.startswith(qt[:4]) or qt.startswith(tt[:4]) for tt in ttokens) for qt in qtokens):
+            matches.append(r)
+    return matches
+
+
+def _match_label(r) -> str:
+    """Подпись задачи для кнопки выбора при удалении."""
+    if r["recurrence"] == "yearly":
+        d = datetime.fromisoformat(r["remind_at"]).date()
+        return f"🎂 {ru_day_month(d)} {r['text']}"
+    dt = datetime.fromisoformat(r["remind_at"])
+    return f"{dt:%d.%m %H:%M} {r['text']}"
+
+
+async def handle_delete_request(update: Update, context, raw_text: str):
+    """Удаление по фразе: 'удали зал'. Одно совпадение — удаляем, несколько — кнопки выбора."""
+    query = DELETE_RE.sub("", raw_text, count=1).strip(" ,.:-—")
+    matches = find_matches(query)
+
+    if not matches:
+        hint = f" по «{query}»" if query else ""
+        await update.message.reply_text(
+            f"Не нашёл, что удалить{hint}. Посмотри /today или /week и удали кнопкой 🗑."
+        )
+        return
+
+    if len(matches) == 1:  # однозначно — удаляем сразу
+        r = matches[0]
+        delete_reminder(r["id"])
+        unschedule_reminder(r["id"])
+        await update.message.reply_text(f"🗑 Удалил: {r['text']}")
+        return
+
+    # несколько похожих — даём выбрать кнопкой
+    items = [("list", r["id"], _match_label(r)) for r in matches]
+    await update.message.reply_text(
+        "Нашёл несколько — что удалить?",
+        reply_markup=_delete_keyboard(items),
+    )
+
+
 async def process_free_text(update: Update, context, raw_text: str):
     """
     Общая логика для текстовых и голосовых сообщений.
-    Понимает дату, время и дни рождения; если дата есть, а времени нет — переспрашивает.
+    Понимает дату, время, дни рождения и удаление; если дата есть, а времени нет — переспрашивает.
     """
+    # 0) Просьба удалить — обрабатываем отдельно (и текстом, и голосом).
+    if is_delete_intent(raw_text):
+        await handle_delete_request(update, context, raw_text)
+        return
+
     # 1) Если раньше переспросили «во сколько?» — пробуем понять ответ как время.
     pending = context.user_data.get("pending")
     if pending:
@@ -398,7 +482,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "<i>позвонить маме через 2 часа</i>\n"
         "<i>15.06 в 10:00 оплатить аренду</i>\n"
         "<i>ДР мамы 20 августа</i>\n\n"
-        "Если скажешь только дату — переспрошу время.\n\n"
+        "Если скажешь только дату — переспрошу время.\n"
+        "Удалить: скажи «<i>удали зал</i>» или нажми 🗑 под задачей.\n\n"
         "Команды:\n"
         "/today — задачи на сегодня\n"
         "/week — задачи на 7 дней вперёд\n"
@@ -479,32 +564,55 @@ def task_line(dt: datetime, text: str) -> str:
     return f"<code>{dt:%H:%M}</code> {pick_emoji(text)} {text}"
 
 
-async def cmd_today(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_owner(update):
-        return
+def _short(s: str, n: int = 25) -> str:
+    """Обрезает подпись кнопки, чтобы не была слишком длинной."""
+    return s if len(s) <= n else s[: n - 1] + "…"
 
+
+def _delete_keyboard(items):
+    """items — список (view, id, подпись). Делаем по кнопке 🗑 на строку."""
+    if not items:
+        return None
+    rows = [
+        [InlineKeyboardButton(f"🗑 {_short(label)}", callback_data=f"del:{view}:{rid}")]
+        for view, rid, label in items
+    ]
+    return InlineKeyboardMarkup(rows)
+
+
+def _next_birthday(r, today: date) -> date:
+    """Ближайшая будущая дата ДР (в этом году или в следующем)."""
+    d = datetime.fromisoformat(r["remind_at"]).date()
+    for year in (today.year, today.year + 1):
+        try:
+            nxt = date(year, d.month, d.day)
+        except ValueError:           # 29 февраля в невисокосный год → 1 марта
+            nxt = date(year, 3, 1)
+        if nxt >= today:
+            return nxt
+    return today
+
+
+def render_today():
     today = datetime.now(TZ).date()
     rows = [
         r for r in get_active_reminders()
         if r["recurrence"] == "none" and datetime.fromisoformat(r["remind_at"]).date() == today
     ]
-
     if not rows:
-        await update.message.reply_text("✨ На сегодня пусто")
-        return
+        return "✨ На сегодня пусто", None
 
     rows.sort(key=lambda r: r["remind_at"])  # ISO-строки сортируются по времени корректно
     lines = ["📋 <b>Задачи на сегодня:</b>\n"]
+    items = []
     for r in rows:
-        lines.append(task_line(datetime.fromisoformat(r["remind_at"]), r["text"]))
+        dt = datetime.fromisoformat(r["remind_at"])
+        lines.append(task_line(dt, r["text"]))
+        items.append(("today", r["id"], f"{dt:%H:%M} {r['text']}"))
+    return "\n".join(lines), _delete_keyboard(items)
 
-    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 
-
-async def cmd_week(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_owner(update):
-        return
-
+def render_week():
     today = datetime.now(TZ).date()
     end = today + timedelta(days=6)  # сегодня + 6 дней = 7 дней всего
     rows = [
@@ -512,13 +620,12 @@ async def cmd_week(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if r["recurrence"] == "none"
         and today <= datetime.fromisoformat(r["remind_at"]).date() <= end
     ]
-
     if not rows:
-        await update.message.reply_text("✨ На ближайшую неделю задач нет")
-        return
+        return "✨ На ближайшую неделю задач нет", None
 
     rows.sort(key=lambda r: r["remind_at"])
     lines = []
+    items = []
     current_day = None
     for r in rows:
         dt = datetime.fromisoformat(r["remind_at"])
@@ -529,65 +636,39 @@ async def cmd_week(update: Update, context: ContextTypes.DEFAULT_TYPE):
             lines.append(f"📅 <b>{ru_date_header(d)}</b>")
             current_day = d
         lines.append(task_line(dt, r["text"]))
+        items.append(("week", r["id"], f"{dt:%d.%m %H:%M} {r['text']}"))
+    return "\n".join(lines), _delete_keyboard(items)
 
-    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 
-
-async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_owner(update):
-        return
-
-    # Только разовые задачи; дни рождения — в /birthdays.
+def render_list():
     reminders = [r for r in get_active_reminders() if r["recurrence"] == "none"]
-
     if not reminders:
-        await update.message.reply_text("✨ Задач нет. Просто напиши, что и когда напомнить.")
-        return
+        return "✨ Задач нет. Просто напиши, что и когда напомнить.", None
 
     lines = ["📋 <b>Твои задачи:</b>\n"]
+    items = []
     for r in reminders:
         dt = datetime.fromisoformat(r["remind_at"])
-        emoji = pick_emoji(r["text"])
-        lines.append(f"{emoji} {r['text']} <code>{format_when(dt)}</code>  #{r['id']}")
+        lines.append(f"{pick_emoji(r['text'])} {r['text']} <code>{format_when(dt)}</code>")
+        items.append(("list", r["id"], f"{dt:%d.%m %H:%M} {r['text']}"))
+    return "\n".join(lines), _delete_keyboard(items)
 
-    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 
-
-async def cmd_birthdays(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_owner(update):
-        return
-
+def render_birthdays():
     bdays = [r for r in get_active_reminders() if r["recurrence"] == "yearly"]
     if not bdays:
-        await update.message.reply_text(
-            "🎂 Дней рождения пока нет.\nДобавь, например: <i>ДР мамы 20 августа</i>",
-            parse_mode="HTML",
-        )
-        return
+        return "🎂 Дней рождения пока нет.\nДобавь, например: ДР мамы 20 августа", None
 
     today = datetime.now(TZ).date()
-
-    def next_occurrence(r) -> date:
-        """Ближайшая будущая дата этого ДР (в этом году или в следующем)."""
-        d = datetime.fromisoformat(r["remind_at"]).date()
-        for year in (today.year, today.year + 1):
-            try:
-                nxt = date(year, d.month, d.day)
-            except ValueError:           # 29 февраля в невисокосный год → 1 марта
-                nxt = date(year, 3, 1)
-            if nxt >= today:
-                return nxt
-        return today
-
-    # Ближайший по дате — сверху.
-    bdays.sort(key=next_occurrence)
+    bdays.sort(key=lambda r: _next_birthday(r, today))  # ближайший — сверху
 
     lines = ["🎂 <b>Дни рождения:</b>\n"]
+    items = []
     for i, r in enumerate(bdays):
         d = datetime.fromisoformat(r["remind_at"]).date()
         suffix = ""
         if i == 0:  # «через N дней» считаем только до ближайшего
-            days = (next_occurrence(r) - today).days
+            days = (_next_birthday(r, today) - today).days
             if days == 0:
                 suffix = " (сегодня! 🎉)"
             elif days == 1:
@@ -595,8 +676,65 @@ async def cmd_birthdays(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else:
                 suffix = f" (через {days} {days_word(days)})"
         lines.append(f"<code>{ru_day_month(d)}</code> — {r['text']}{suffix}")
+        items.append(("bday", r["id"], f"{ru_day_month(d)} {r['text']}"))
+    return "\n".join(lines), _delete_keyboard(items)
 
-    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+
+# Сопоставление имени вида с его рендером — нужно при перерисовке после удаления.
+RENDERERS = {
+    "today": render_today, "week": render_week,
+    "list": render_list, "bday": render_birthdays,
+}
+
+
+async def cmd_today(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update):
+        return
+    text, markup = render_today()
+    await update.message.reply_text(text, parse_mode="HTML", reply_markup=markup)
+
+
+async def cmd_week(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update):
+        return
+    text, markup = render_week()
+    await update.message.reply_text(text, parse_mode="HTML", reply_markup=markup)
+
+
+async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update):
+        return
+    text, markup = render_list()
+    await update.message.reply_text(text, parse_mode="HTML", reply_markup=markup)
+
+
+async def cmd_birthdays(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update):
+        return
+    text, markup = render_birthdays()
+    await update.message.reply_text(text, parse_mode="HTML", reply_markup=markup)
+
+
+async def on_delete_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Нажата кнопка 🗑: удаляем задачу и перерисовываем тот же список."""
+    query = update.callback_query
+    if update.effective_user.id != MY_CHAT_ID:
+        await query.answer()
+        return
+
+    _, view, rid = query.data.split(":")
+    rid = int(rid)
+    row = get_reminder_by_id(rid)
+
+    delete_reminder(rid)
+    unschedule_reminder(rid)
+
+    await query.answer("Удалено 🗑" if row else "Уже удалено")
+
+    # Перерисовываем тот же список без удалённой задачи.
+    render = RENDERERS.get(view, render_list)
+    text, markup = render()
+    await query.edit_message_text(text, parse_mode="HTML", reply_markup=markup)
 
 
 async def cmd_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -696,6 +834,9 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("list",  cmd_list))
     app.add_handler(CommandHandler("birthdays", cmd_birthdays))
     app.add_handler(CommandHandler("done",  cmd_done))
+
+    # Нажатия кнопок 🗑 удаления
+    app.add_handler(CallbackQueryHandler(on_delete_button, pattern=r"^del:"))
 
     # Свободный текст и голос — после команд, чтобы не перехватывать /команды
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))

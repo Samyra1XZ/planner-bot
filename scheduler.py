@@ -89,6 +89,21 @@ def schedule_reminder(bot, chat_id: int, reminder_id: int, text: str,
     return True
 
 
+def unschedule_reminder(reminder_id: int):
+    """
+    Снимает все джобы напоминания (на случай удаления): и разовые (id + _pre),
+    и ежегодные (_bd2 + _bd0). Несуществующие тихо игнорируем.
+    """
+    for job_id in (
+        str(reminder_id), f"{reminder_id}_pre",
+        f"{reminder_id}_bd2", f"{reminder_id}_bd0",
+    ):
+        try:
+            scheduler.remove_job(job_id)
+        except Exception:
+            pass  # такого джоба нет — это нормально
+
+
 def reschedule_all(bot, chat_id: int, reminders):
     """
     При перезапуске бота восстанавливает все активные напоминания из базы.
