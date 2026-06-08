@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import datetime, timedelta
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 # Один планировщик на всё приложение — создаём здесь, запускаем в bot.py
@@ -6,11 +6,8 @@ scheduler = AsyncIOScheduler()
 
 
 async def _send_reminder(bot, chat_id: int, text: str):
-    """
-    Эту функцию вызывает планировщик автоматически в нужное время.
-    Подчёркивание в начале имени (_send) — соглашение: функция "приватная", только для внутреннего использования.
-    """
-    await bot.send_message(chat_id=chat_id, text=f"⏰ Напоминание: {text}")
+    # Планировщик вызывает эту функцию автоматически — text уже содержит нужный префикс (🔔 или ⏰)
+    await bot.send_message(chat_id=chat_id, text=text)
 
 
 def schedule_reminder(bot, chat_id: int, reminder_id: int, text: str, time_str: str) -> bool:
@@ -30,14 +27,28 @@ def schedule_reminder(bot, chat_id: int, reminder_id: int, text: str, time_str: 
     if run_date <= now:
         return False
 
+    # Основное напоминание — в точное время
     scheduler.add_job(
-        _send_reminder,              # какую функцию вызвать
-        trigger="date",              # один раз в конкретный момент (не повторяющийся)
-        run_date=run_date,           # когда именно
-        args=[bot, chat_id, text],   # аргументы для _send_reminder
-        id=str(reminder_id),         # уникальный id задачи (чтобы не дублировать)
-        replace_existing=True        # если задача с таким id уже есть — заменить
+        _send_reminder,
+        trigger="date",
+        run_date=run_date,
+        args=[bot, chat_id, f"🔔 Сейчас: {text}"],
+        id=str(reminder_id),
+        replace_existing=True
     )
+
+    # Предварительное напоминание — за 10 минут, если ещё не прошло
+    pre_date = run_date - timedelta(minutes=10)
+    if pre_date > now:
+        scheduler.add_job(
+            _send_reminder,
+            trigger="date",
+            run_date=pre_date,
+            args=[bot, chat_id, f"⏰ Через 10 минут: {text}"],
+            id=f"{reminder_id}_pre",
+            replace_existing=True
+        )
+
     return True
 
 
