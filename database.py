@@ -1,8 +1,15 @@
+import os
 import sqlite3
 from datetime import datetime
 
-# Имя файла базы данных — будет создан рядом со скриптом
-DB_FILE = "reminders.db"
+from dotenv import load_dotenv
+
+load_dotenv()
+
+# Путь к базе. По умолчанию файл рядом со скриптом.
+# На Railway укажи DB_PATH=/data/reminders.db и примонтируй Volume в /data —
+# иначе база (а с ней ВСЕ будущие задачи и дни рождения) сбрасывается при каждом редеплое.
+DB_FILE = os.getenv("DB_PATH", "reminders.db")
 
 
 def get_connection():
@@ -19,6 +26,11 @@ def init_db():
     remind_at теперь хранит полную дату-время в ISO: 'YYYY-MM-DD HH:MM'.
     recurrence: 'none' (разовое) или 'yearly' (день рождения/годовщина).
     """
+    # Если DB_PATH в подкаталоге (например /data/reminders.db) — создаём его.
+    parent = os.path.dirname(DB_FILE)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+
     conn = get_connection()
     conn.execute("""
         CREATE TABLE IF NOT EXISTS reminders (
