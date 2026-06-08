@@ -2,15 +2,14 @@ import asyncio
 import os
 import re
 import tempfile
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 
-import dateparser.search
 from dotenv import load_dotenv
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 
 from database import init_db, add_reminder, get_active_reminders, mark_done
-from scheduler import scheduler, schedule_reminder, reschedule_all
+from scheduler import scheduler, schedule_reminder, reschedule_all, TZ
 from stt import transcribe
 
 # Загружаем переменные из файла .env (BOT_TOKEN, MY_CHAT_ID)
@@ -46,7 +45,7 @@ FILLER_WORDS = {
     "надо", "нужно", "мне", "себе", "пожалуйста", "плиз",
 }
 
-# Слова-даты: для нашего «однодневного» бота в названии задачи они не нужны.
+# Слова-даты: в названии задачи они не нужны (дату вытащит extract_date отдельно).
 DATE_WORDS = {
     "сегодня", "завтра", "послезавтра", "сейчас", "нынче", "утром", "днём", "днем",
     "вечером", "ночью", "понедельник", "вторник", "среду", "четверг", "пятницу",
@@ -87,11 +86,11 @@ def extract_time(text: str):
     # (\w* доедает окончание слова: час/часа/часов, мин/минут)
     m = re.search(r"через\s+(\d{1,2})\s*час\w*", t)
     if m:
-        base = datetime.now() + timedelta(hours=int(m.group(1)))
+        base = datetime.now(TZ) + timedelta(hours=int(m.group(1)))
         return base.hour, base.minute, m.span()
     m = re.search(r"через\s+(\d{1,3})\s*мин\w*", t)
     if m:
-        base = datetime.now() + timedelta(minutes=int(m.group(1)))
+        base = datetime.now(TZ) + timedelta(minutes=int(m.group(1)))
         return base.hour, base.minute, m.span()
 
     # Явное ЧЧ:ММ или ЧЧ.ММ
@@ -150,70 +149,240 @@ def clean_task_text(text: str) -> str:
     return cleaned
 
 
-def parse_task_from_text(text: str):
+# Месяцы (по основе слова, чтобы ловить «июня», «августа» и т.п.).
+# Порядок важен: «март» раньше «май», иначе «марта» уйдёт не туда.
+MONTH_STEMS = [
+    ("январ", 1), ("феврал", 2), ("март", 3), ("апрел", 4), ("май", 5), ("мая", 5),
+    ("июн", 6), ("июл", 7), ("август", 8), ("сентябр", 9), ("октябр", 10),
+    ("ноябр", 11), ("декабр", 12),
+]
+
+# Дни недели как точные шаблоны (понедельник=0 ... воскресенье=6).
+# «сред[ауы]» — чтобы не цеплять «средство» и т.п.
+WEEKDAY_PATTERNS = [
+    (r"понедельник\w*", 0), (r"вторник\w*", 1), (r"сред[ауы]\b", 2),
+    (r"четверг\w*", 3), (r"пятниц\w*", 4), (r"суббот\w*", 5), (r"воскресень\w*", 6),
+]
+
+# Признаки дня рождения / годовщины → ежегодное напоминание.
+BIRTHDAY_RE = re.compile(r"день\s+рождени\w*|днюх\w*|годовщин\w*|\bдр\b|\bд\.?\s?р\.?", re.IGNORECASE)
+
+
+def _month_from_word(word: str):
+    for stem, num in MONTH_STEMS:
+        if word.startswith(stem):
+            return num
+    return None
+
+
+def extract_date(text: str):
     """
-    Достаёт время и текст задачи из произвольной фразы.
-    Возвращает (datetime, текст_задачи) или (None, исходный_текст) если время не найдено.
-    Сначала пробуем свой надёжный экстрактор, затем dateparser как запасной вариант.
+    Достаёт дату из фразы. Возвращает (datetime.date, (start, end)) или None.
+    Понимает: 15.06.2026 / 15.06 / 15 июня [2026] / сегодня / завтра /
+    послезавтра / «в пятницу». Год не указан → этот год, а если дата уже
+    прошла — следующий (для разовых задач).
     """
-    found = extract_time(text)
-    if found is not None:
-        hour, minute, (start, end) = found
-        dt = datetime.now().replace(hour=hour, minute=minute, second=0, microsecond=0)
-        task_text = clean_task_text(text[:start] + " " + text[end:])
-        if not task_text:
-            task_text = clean_task_text(text)
-        return dt, task_text
+    t = text.lower()
+    today = datetime.now(TZ).date()
 
-    # Запасной путь: вдруг dateparser поймёт что-то нестандартное.
-    results = dateparser.search.search_dates(
-        text,
-        languages=["ru"],
-        settings={"PREFER_DATES_FROM": "future", "RETURN_AS_TIMEZONE_AWARE": False},
-    )
-    if not results:
-        return None, text
+    def resolve_year(day, month, year=None):
+        if year is not None:
+            year = year + 2000 if year < 100 else year
+            return date(year, month, day)
+        d = date(today.year, month, day)
+        return d if d >= today else date(today.year + 1, month, day)
 
-    dt = results[0][1]
-    task_text = text
-    for matched_str, _ in results:
-        task_text = task_text.replace(matched_str, " ")
-    task_text = clean_task_text(task_text)
-    if not task_text:
-        task_text = clean_task_text(text)
-    return dt, task_text
+    # 15.06 или 15.06.2026 (точка/слэш). Месяц 1–12, день 1–31 — иначе это не дата (а время).
+    m = re.search(r"\b(\d{1,2})[./](\d{1,2})(?:[./](\d{2,4}))?\b", t)
+    if m:
+        day, month = int(m.group(1)), int(m.group(2))
+        year = int(m.group(3)) if m.group(3) else None
+        if 1 <= month <= 12 and 1 <= day <= 31:
+            try:
+                return resolve_year(day, month, year), m.span()
+            except ValueError:
+                pass
+
+    # 15 июня [2026]
+    m = re.search(r"\b(\d{1,2})\s+([а-я]+)(?:\s+(\d{4}))?\b", t)
+    if m:
+        month = _month_from_word(m.group(2))
+        if month:
+            day = int(m.group(1))
+            year = int(m.group(3)) if m.group(3) else None
+            try:
+                return resolve_year(day, month, year), m.span()
+            except ValueError:
+                pass
+
+    # послезавтра / завтра / сегодня
+    m = re.search(r"послезавтра", t)
+    if m:
+        return today + timedelta(days=2), m.span()
+    m = re.search(r"завтра", t)
+    if m:
+        return today + timedelta(days=1), m.span()
+    m = re.search(r"сегодня", t)
+    if m:
+        return today, m.span()
+
+    # «в пятницу» / «понедельник» → ближайший такой день недели
+    for pattern, wd in WEEKDAY_PATTERNS:
+        m = re.search(r"\b" + pattern, t)
+        if m:
+            ahead = (wd - today.weekday()) % 7
+            ahead = ahead or 7  # сегодня этот день → берём следующий такой
+            return today + timedelta(days=ahead), m.span()
+
+    return None
 
 
-async def process_free_text(update: Update, context, raw_text: str):
+def _blank(text: str, span) -> str:
+    """Заменяет найденный кусок пробелами (длина строки сохраняется)."""
+    start, end = span
+    return text[:start] + " " * (end - start) + text[end:]
+
+
+def parse_when(text: str) -> dict:
     """
-    Общая логика для текстовых и голосовых сообщений:
-    распарсить время → сохранить в базу → запланировать напоминание.
+    Разбирает фразу в структуру:
+      {recurrence, date, time, task}
+    recurrence: 'none' | 'yearly' (день рождения)
+    date: datetime.date | None
+    time: (hour, minute) | None
+    task: очищенное название
     """
-    dt, task_text = parse_task_from_text(raw_text)
+    recurrence = "yearly" if BIRTHDAY_RE.search(text) else "none"
 
-    if dt is None:
+    work = text
+    # Сначала дату (чтобы «15.06» не утащил разбор времени), потом время.
+    date_found = extract_date(work)
+    the_date = None
+    if date_found is not None:
+        the_date, span = date_found
+        work = _blank(work, span)
+
+    time_found = extract_time(work)
+    the_time = None
+    if time_found is not None:
+        hour, minute, span = time_found
+        the_time = (hour, minute)
+        work = _blank(work, span)
+
+    # Убираем сам маркер «день рождения / ДР» из названия
+    for m in BIRTHDAY_RE.finditer(work):
+        work = _blank(work, m.span())
+
+    task = clean_task_text(work) or clean_task_text(text)
+    return {"recurrence": recurrence, "date": the_date, "time": the_time, "task": task}
+
+
+def format_date(d: date) -> str:
+    """Дата для вывода: '15.06' или '15.06.2027' если год не текущий."""
+    today = datetime.now(TZ).date()
+    return d.strftime("%d.%m.%Y") if d.year != today.year else d.strftime("%d.%m")
+
+
+def format_when(dt: datetime) -> str:
+    """Человеческая подпись момента: 'сегодня в 11:00' / 'завтра ...' / '15.06 в 10:00'."""
+    today = datetime.now(TZ).date()
+    d = dt.date()
+    if d == today:
+        prefix = "сегодня"
+    elif d == today + timedelta(days=1):
+        prefix = "завтра"
+    else:
+        prefix = format_date(d)
+    return f"{prefix} в {dt.strftime('%H:%M')}"
+
+
+async def _create_reminder(update, context, task, d: date, hm, recurrence, rolled=False):
+    """Сохраняет напоминание в базу, ставит в планировщик и отвечает пользователю."""
+    dt = datetime(d.year, d.month, d.day, hm[0], hm[1])
+    remind_at = dt.strftime("%Y-%m-%d %H:%M")
+    reminder_id = add_reminder(task, remind_at, recurrence)
+    scheduled = schedule_reminder(context.bot, MY_CHAT_ID, reminder_id, task, remind_at, recurrence)
+
+    if recurrence == "yearly":
         await update.message.reply_text(
-            "⏰ Не понял время. Напиши когда, например:\n"
-            "<i>завтра в 15:00 встреча с клиентом</i>",
+            f"✅ Запомнил день рождения:\n🎂 {task} — {format_date(d)} "
+            f"<i>(ежегодно: напомню за 2 дня и утром в день)</i>",
             parse_mode="HTML",
         )
         return
 
-    time_str = dt.strftime("%H:%M")
-    reminder_id = add_reminder(task_text, time_str)
-    scheduled = schedule_reminder(context.bot, MY_CHAT_ID, reminder_id, task_text, time_str)
-
-    emoji = pick_emoji(task_text)
     if scheduled:
+        extra = " <i>(перенёс на завтра — сегодня это время уже прошло)</i>" if rolled else ""
         await update.message.reply_text(
-            f"✅ Понял! Напомню:\n{emoji} {task_text} <code>в {time_str}</code>",
+            f"✅ Понял! Напомню {format_when(dt)}:\n{pick_emoji(task)} {task}{extra}",
             parse_mode="HTML",
         )
     else:
-        # Время уже прошло — задача сохранена, но сегодня не сработает
         await update.message.reply_text(
-            f"Сохранено, но {time_str} уже прошло — сегодня напоминания не будет."
+            f"Дата {format_when(dt)} уже прошла — напоминание не поставил."
         )
+
+
+async def process_free_text(update: Update, context, raw_text: str):
+    """
+    Общая логика для текстовых и голосовых сообщений.
+    Понимает дату, время и дни рождения; если дата есть, а времени нет — переспрашивает.
+    """
+    # 1) Если раньше переспросили «во сколько?» — пробуем понять ответ как время.
+    pending = context.user_data.get("pending")
+    if pending:
+        tf = extract_time(raw_text)
+        leftover = clean_task_text(_blank(raw_text, tf[2])) if tf else clean_task_text(raw_text)
+        if tf and not leftover:  # это действительно просто время — достраиваем задачу
+            context.user_data.pop("pending")
+            d = date.fromisoformat(pending["date"])
+            await _create_reminder(update, context, pending["task"], d, (tf[0], tf[1]), "none")
+            return
+        context.user_data.pop("pending")  # иначе это новая фраза — забываем и разбираем заново
+
+    parsed = parse_when(raw_text)
+    recurrence, the_date, the_time, task = (
+        parsed["recurrence"], parsed["date"], parsed["time"], parsed["task"],
+    )
+
+    # 2) День рождения — нужна дата (день и месяц), время по умолчанию 09:00.
+    if recurrence == "yearly":
+        if the_date is None:
+            await update.message.reply_text(
+                "🎂 Не понял дату дня рождения. Например:\n<i>ДР мамы 20 августа</i>",
+                parse_mode="HTML",
+            )
+            return
+        await _create_reminder(update, context, task, the_date, the_time or (9, 0), "yearly")
+        return
+
+    # 3) Обычная задача
+    if the_date is None and the_time is None:
+        await update.message.reply_text(
+            "⏰ Не понял когда. Например:\n"
+            "<i>завтра в 15:00 встреча</i>  или  <i>15.06 в 10:00 оплатить аренду</i>",
+            parse_mode="HTML",
+        )
+        return
+
+    if the_time is None:  # дата есть, времени нет → переспрашиваем
+        context.user_data["pending"] = {"date": the_date.isoformat(), "task": task}
+        await update.message.reply_text(
+            f"🕐 Во сколько напомнить <b>{format_date(the_date)}</b>? "
+            f"Напиши время, например <i>11:00</i>",
+            parse_mode="HTML",
+        )
+        return
+
+    # Время есть. Нет даты → сегодня; если сегодня уже прошло — переносим на завтра.
+    rolled = False
+    d = the_date or datetime.now(TZ).date()
+    if the_date is None:
+        candidate = datetime(d.year, d.month, d.day, the_time[0], the_time[1])
+        if candidate <= datetime.now(TZ).replace(tzinfo=None):
+            d = d + timedelta(days=1)
+            rolled = True
+    await _create_reminder(update, context, task, d, the_time, "none", rolled=rolled)
 
 
 # ───────────────────────── Обработчики команд ──────────────────────────
@@ -223,15 +392,18 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     await update.message.reply_text(
-        "Привет! Я твой личный планер.\n\n"
-        "Просто напиши мне задачу с временем:\n"
-        "<i>встреча с клиентом в 15:00</i>\n"
-        "<i>позвонить маме через 2 часа</i>\n\n"
-        "Или отправь голосовое сообщение 🎤\n\n"
+        "Привет! Я твой личный планер. ⏱ Время — по Бали (UTC+8).\n\n"
+        "Просто напиши или скажи 🎤 задачу — я сам пойму когда:\n"
+        "<i>завтра в 15:00 встреча с клиентом</i>\n"
+        "<i>позвонить маме через 2 часа</i>\n"
+        "<i>15.06 в 10:00 оплатить аренду</i>\n"
+        "<i>ДР мамы 20 августа</i>\n\n"
+        "Если скажешь только дату — переспрошу время.\n\n"
         "Команды:\n"
-        "/add 15:00 текст — добавить напоминание\n"
-        "/list — показать расписание\n"
-        "/done 3 — отметить задачу #3 выполненной",
+        "/list — задачи\n"
+        "/birthdays — дни рождения\n"
+        "/add 15:00 текст — задача на сегодня\n"
+        "/done 3 — отметить выполненной",
         parse_mode="HTML",
     )
 
@@ -258,8 +430,11 @@ async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    reminder_id = add_reminder(text, time_str)
-    scheduled = schedule_reminder(context.bot, MY_CHAT_ID, reminder_id, text, time_str)
+    # /add ставит задачу на сегодня в указанное время.
+    today = datetime.now(TZ).date()
+    remind_at = f"{today.isoformat()} {time_str}"
+    reminder_id = add_reminder(text, remind_at)
+    scheduled = schedule_reminder(context.bot, MY_CHAT_ID, reminder_id, text, remind_at)
 
     if scheduled:
         await update.message.reply_text(f"✅ Добавлено: [{time_str}] {text}")
@@ -273,16 +448,41 @@ async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_owner(update):
         return
 
-    reminders = get_active_reminders()
+    # Только разовые задачи; дни рождения — в /birthdays.
+    reminders = [r for r in get_active_reminders() if r["recurrence"] == "none"]
 
     if not reminders:
-        await update.message.reply_text("✨ На сегодня пусто. Добавь задачу через /add")
+        await update.message.reply_text("✨ Задач нет. Просто напиши, что и когда напомнить.")
         return
 
-    lines = ["📋 <b>Твоё расписание на сегодня:</b>\n"]
+    lines = ["📋 <b>Твои задачи:</b>\n"]
     for r in reminders:
+        dt = datetime.fromisoformat(r["remind_at"])
         emoji = pick_emoji(r["text"])
-        lines.append(f"{emoji} {r['text']} <code>в {r['remind_at']}</code>")
+        lines.append(f"{emoji} {r['text']} <code>{format_when(dt)}</code>  #{r['id']}")
+
+    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+
+
+async def cmd_birthdays(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update):
+        return
+
+    bdays = [r for r in get_active_reminders() if r["recurrence"] == "yearly"]
+    if not bdays:
+        await update.message.reply_text(
+            "🎂 Дней рождения пока нет.\nДобавь, например: <i>ДР мамы 20 августа</i>",
+            parse_mode="HTML",
+        )
+        return
+
+    # Сортируем по месяцу и дню, чтобы шли по календарю.
+    bdays.sort(key=lambda r: datetime.fromisoformat(r["remind_at"]).strftime("%m-%d"))
+
+    lines = ["🎂 <b>Дни рождения:</b>\n"]
+    for r in bdays:
+        d = datetime.fromisoformat(r["remind_at"]).date()
+        lines.append(f"🎂 {r['text']} — <code>{d.strftime('%d.%m')}</code>  #{r['id']}")
 
     await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 
@@ -380,6 +580,7 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("add",   cmd_add))
     app.add_handler(CommandHandler("list",  cmd_list))
+    app.add_handler(CommandHandler("birthdays", cmd_birthdays))
     app.add_handler(CommandHandler("done",  cmd_done))
 
     # Свободный текст и голос — после команд, чтобы не перехватывать /команды

@@ -1,4 +1,5 @@
 import sqlite3
+from datetime import datetime
 
 # Имя файла базы данных — будет создан рядом со скриптом
 DB_FILE = "reminders.db"
@@ -13,30 +14,49 @@ def get_connection():
 
 
 def init_db():
-    """Создаёт таблицу reminders, если её ещё нет. Вызывается один раз при старте."""
+    """
+    Создаёт таблицу reminders, если её ещё нет, и мигрирует старую схему.
+    remind_at теперь хранит полную дату-время в ISO: 'YYYY-MM-DD HH:MM'.
+    recurrence: 'none' (разовое) или 'yearly' (день рождения/годовщина).
+    """
     conn = get_connection()
     conn.execute("""
         CREATE TABLE IF NOT EXISTS reminders (
-            id        INTEGER PRIMARY KEY AUTOINCREMENT,
-            text      TEXT    NOT NULL,
-            remind_at TEXT    NOT NULL,
-            done      INTEGER NOT NULL DEFAULT 0
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            text       TEXT    NOT NULL,
+            remind_at  TEXT    NOT NULL,
+            recurrence TEXT    NOT NULL DEFAULT 'none',
+            done       INTEGER NOT NULL DEFAULT 0
         )
     """)
+
+    # ── Миграция со старой схемы (без колонки recurrence и с remind_at='HH:MM') ──
+    columns = [row["name"] for row in conn.execute("PRAGMA table_info(reminders)")]
+    if "recurrence" not in columns:
+        conn.execute("ALTER TABLE reminders ADD COLUMN recurrence TEXT NOT NULL DEFAULT 'none'")
+
+    # Старые записи хранили только время ('15:00', длина 5) — дописываем сегодняшнюю дату.
+    today = datetime.now().strftime("%Y-%m-%d")
+    conn.execute(
+        "UPDATE reminders SET remind_at = ? || ' ' || remind_at WHERE length(remind_at) <= 5",
+        (today,),
+    )
+
     conn.commit()
     conn.close()
 
 
-def add_reminder(text: str, remind_at: str) -> int:
+def add_reminder(text: str, remind_at: str, recurrence: str = "none") -> int:
     """
     Добавляет новое напоминание в базу.
-    remind_at — строка вида '15:00' (время на сегодня).
+    remind_at — строка ISO 'YYYY-MM-DD HH:MM'.
+    recurrence — 'none' (разовое) или 'yearly' (ежегодное, для дней рождения).
     Возвращает id только что созданной записи.
     """
     conn = get_connection()
     cursor = conn.execute(
-        "INSERT INTO reminders (text, remind_at) VALUES (?, ?)",
-        (text, remind_at)
+        "INSERT INTO reminders (text, remind_at, recurrence) VALUES (?, ?, ?)",
+        (text, remind_at, recurrence)
     )
     conn.commit()
     new_id = cursor.lastrowid  # id созданной записи
