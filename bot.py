@@ -78,6 +78,19 @@ async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 
+def pick_emoji(text: str) -> str:
+    t = text.lower()
+    if any(w in t for w in ("тренировка", "спорт", "зал", "бег", "йога", "фитнес")):
+        return "🏋"
+    if any(w in t for w in ("еда", "завтрак", "обед", "ужин", "кафе", "ресторан", "покушать", "поесть")):
+        return "🍽"
+    if any(w in t for w in ("встреча", "встретиться", "встретить")):
+        return "🤝"
+    if any(w in t for w in ("работа", "задача", "чат", "бот", "код", "программ", "разработка", "созвон", "звонок")):
+        return "💻"
+    return "📌"
+
+
 async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/list — показывает все невыполненные напоминания."""
     if not is_owner(update):
@@ -86,15 +99,15 @@ async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reminders = get_active_reminders()
 
     if not reminders:
-        await update.message.reply_text("Активных напоминаний нет.")
+        await update.message.reply_text("✨ На сегодня пусто. Добавь задачу через /add")
         return
 
-    # Собираем строки вида: #1 [15:00] написать клиенту
-    lines = []
+    lines = ["📋 <b>Твоё расписание на сегодня:</b>\n"]
     for r in reminders:
-        lines.append(f"#{r['id']} [{r['remind_at']}] {r['text']}")
+        emoji = pick_emoji(r["text"])
+        lines.append(f"<code>{r['remind_at']}</code>  {emoji} {r['text']}")
 
-    await update.message.reply_text("\n".join(lines))
+    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 
 
 async def cmd_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
