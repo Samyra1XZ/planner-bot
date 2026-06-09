@@ -6,14 +6,16 @@ from datetime import datetime, timedelta, date
 from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import (
+    Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup,
+)
 from telegram.ext import (
     Application, CommandHandler, ContextTypes, MessageHandler, CallbackQueryHandler, filters,
 )
 
 from database import (
     init_db, add_reminder, get_active_reminders, get_all_active_reminders, mark_done,
-    delete_reminder, get_reminder_by_id, update_reminder_time,
+    delete_reminder, get_reminder_by_id, update_reminder_time, count_done_on,
     ensure_user, get_user_timezone,
 )
 from scheduler import scheduler, schedule_reminder, reschedule_all, unschedule_reminder, TZ
@@ -40,6 +42,26 @@ def _tz(user_id: int) -> ZoneInfo:
         return ZoneInfo(get_user_timezone(user_id))
     except Exception:
         return TZ
+
+
+# ───────────────────────── Меню-клавиатура (интерфейс без команд) ──────────────────────────
+
+# Подписи кнопок нижнего меню. Нажатие присылает ровно этот текст —
+# перехватываем его в handle_text ДО разбора через Gemini.
+MENU_TODAY = "📋 Сегодня"
+MENU_WEEK = "🗓 Неделя"
+MENU_BDAY = "🎂 Дни рождения"
+MENU_LIST = "📝 Все задачи"
+MENU_ADD = "➕ Новая задача"
+
+
+def build_menu() -> ReplyKeyboardMarkup:
+    """Постоянное меню внизу экрана — навигация тапами, без ввода команд."""
+    return ReplyKeyboardMarkup(
+        [[MENU_TODAY, MENU_WEEK], [MENU_BDAY, MENU_LIST], [MENU_ADD]],
+        resize_keyboard=True,    # компактные кнопки по размеру текста
+        is_persistent=True,      # меню не прячется после нажатия
+    )
 
 
 # ───────────────────────── Эмодзи по смыслу задачи ──────────────────────────
@@ -248,11 +270,14 @@ async def process_free_text(update: Update, context, raw_text: str):
             report.append(_do_reschedule(context, action, user_id, tz))
 
     if report:
-        await update.message.reply_text("\n".join(report), parse_mode="HTML")
+        # К отчёту прикрепляем нижнее меню — так оно всегда под рукой.
+        await update.message.reply_text(
+            "\n".join(report), parse_mode="HTML", reply_markup=build_menu()
+        )
 
     # Неоднозначные удаления — отдельными сообщениями с кнопками выбора.
     for prompt, items in pending_buttons:
-        await update.message.reply_text(prompt, reply_markup=_delete_keyboard(items))
+        await update.message.reply_text(prompt, reply_markup=_item_keyboard(items, with_done=False))
 
 
 # ───────────────────────── Обработчики команд ──────────────────────────
@@ -280,6 +305,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/add 15:00 текст — задача на сегодня\n"
         "/done 3 — отметить выполненной",
         parse_mode="HTML",
+        reply_markup=build_menu(),   # показываем нижнее меню
     )
 
 
@@ -355,14 +381,25 @@ def _short(s: str, n: int = 25) -> str:
     return s if len(s) <= n else s[: n - 1] + "…"
 
 
-def _delete_keyboard(items):
-    """items — список (view, id, подпись). Делаем по кнопке 🗑 на строку."""
+def _item_keyboard(items, with_done: bool = True):
+    """
+    items — список (view, id, подпись). На каждую задачу строка кнопок:
+    с галочкой «✅ выполнено» (основное действие) и 🗑 удалить.
+    with_done=False — только 🗑 (для дней рождения и выбора при удалении).
+    """
     if not items:
         return None
-    rows = [
-        [InlineKeyboardButton(f"🗑 {_short(label)}", callback_data=f"del:{view}:{rid}")]
-        for view, rid, label in items
-    ]
+    rows = []
+    for view, rid, label in items:
+        if with_done:
+            rows.append([
+                InlineKeyboardButton(f"✅ {_short(label)}", callback_data=f"done:{view}:{rid}"),
+                InlineKeyboardButton("🗑", callback_data=f"del:{view}:{rid}"),
+            ])
+        else:
+            rows.append([
+                InlineKeyboardButton(f"🗑 {_short(label)}", callback_data=f"del:{view}:{rid}"),
+            ])
     return InlineKeyboardMarkup(rows)
 
 
@@ -396,7 +433,7 @@ def render_today(user_id: int, tz: ZoneInfo):
         blocks.append(f"{i}. {pick_emoji(r['text'])} {r['text']}\n   🕐 <code>{dt:%H:%M}</code>")
         items.append(("today", r["id"], f"{dt:%H:%M} {r['text']}"))
     body = "\n\n".join(blocks)
-    return f"📋 <b>Задачи на сегодня:</b>\n\n{body}", _delete_keyboard(items)
+    return f"📋 <b>Задачи на сегодня:</b>\n\n{body}", _item_keyboard(items)
 
 
 def render_week(user_id: int, tz: ZoneInfo):
@@ -428,7 +465,7 @@ def render_week(user_id: int, tz: ZoneInfo):
         parts.append("\n".join(day_lines))
 
     body = "\n\n".join(parts)  # пустая строка между днями
-    return f"🗓 <b>Задачи на неделю:</b>\n\n{body}", _delete_keyboard(items)
+    return f"🗓 <b>Задачи на неделю:</b>\n\n{body}", _item_keyboard(items)
 
 
 def render_list(user_id: int, tz: ZoneInfo):
@@ -443,7 +480,7 @@ def render_list(user_id: int, tz: ZoneInfo):
         blocks.append(f"{i}. {pick_emoji(r['text'])} {r['text']}\n   📅 <code>{format_when(dt, tz)}</code>")
         items.append(("list", r["id"], f"{dt:%d.%m %H:%M} {r['text']}"))
     body = "\n\n".join(blocks)
-    return f"📋 <b>Все задачи:</b>\n\n{body}", _delete_keyboard(items)
+    return f"📋 <b>Все задачи:</b>\n\n{body}", _item_keyboard(items)
 
 
 def render_birthdays(user_id: int, tz: ZoneInfo):
@@ -469,13 +506,19 @@ def render_birthdays(user_id: int, tz: ZoneInfo):
         blocks.append(f"{i}. 🎂 {r['text']}\n   📅 <code>{ru_day_month(d)}</code>{suffix}")
         items.append(("bday", r["id"], f"{ru_day_month(d)} {r['text']}"))
     body = "\n\n".join(blocks)
-    return f"🎂 <b>Дни рождения:</b>\n\n{body}", _delete_keyboard(items)
+    return f"🎂 <b>Дни рождения:</b>\n\n{body}", _item_keyboard(items, with_done=False)
 
 
 # Сопоставление имени вида с его рендером — нужно при перерисовке после удаления.
 RENDERERS = {
     "today": render_today, "week": render_week,
     "list": render_list, "bday": render_birthdays,
+}
+
+# Кнопка нижнего меню → какой список показать.
+MENU_RENDERERS = {
+    MENU_TODAY: render_today, MENU_WEEK: render_week,
+    MENU_BDAY: render_birthdays, MENU_LIST: render_list,
 }
 
 
@@ -534,6 +577,34 @@ async def on_delete_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.edit_message_text(text, parse_mode="HTML", reply_markup=markup)
 
 
+async def on_done_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Нажата кнопка ✅: отмечаем выполненной, показываем счётчик за день, перерисовываем."""
+    query = update.callback_query
+    uid = update.effective_user.id
+    if uid != MY_CHAT_ID:
+        await query.answer()
+        return
+
+    _, view, rid = query.data.split(":")
+    rid = int(rid)
+    tz = _tz(uid)
+    now = datetime.now(tz)
+
+    ok = mark_done(uid, rid, now.strftime("%Y-%m-%d %H:%M"))
+    unschedule_reminder(rid)  # снимаем запланированные напоминания закрытой задачи
+
+    if ok:
+        done_today = count_done_on(uid, now.date().isoformat())
+        await query.answer(f"Готово ✅  ({done_today} за сегодня)")
+    else:
+        await query.answer("Уже закрыто")
+
+    # Перерисовываем тот же список без закрытой задачи.
+    render = RENDERERS.get(view, render_list)
+    text, markup = render(uid, tz)
+    await query.edit_message_text(text, parse_mode="HTML", reply_markup=markup)
+
+
 async def cmd_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_owner(update):
         return
@@ -548,9 +619,14 @@ async def cmd_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Номер должен быть числом, например: /done 3")
         return
 
-    success = mark_done(update.effective_user.id, reminder_id)
+    uid = update.effective_user.id
+    now = datetime.now(_tz(uid))
+    success = mark_done(uid, reminder_id, now.strftime("%Y-%m-%d %H:%M"))
     if success:
-        await update.message.reply_text(f"✅ Напоминание #{reminder_id} выполнено!")
+        done_today = count_done_on(uid, now.date().isoformat())
+        await update.message.reply_text(
+            f"✅ Напоминание #{reminder_id} выполнено!  ({done_today} за сегодня)"
+        )
     else:
         await update.message.reply_text(
             f"Напоминание #{reminder_id} не найдено или уже выполнено."
@@ -560,10 +636,29 @@ async def cmd_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ───────────────────────── Свободный текст и голос ──────────────────────────
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Принимает обычный текст (не команду) и обрабатывает через Gemini."""
+    """Принимает обычный текст. Сначала проверяем кнопки меню, потом — разбор через Gemini."""
     if not is_owner(update):
         return
-    await process_free_text(update, context, update.message.text)
+
+    text = update.message.text
+    uid = update.effective_user.id
+
+    # Нажата кнопка нижнего меню — показываем нужный список, не трогая Gemini.
+    if text in MENU_RENDERERS:
+        render = MENU_RENDERERS[text]
+        out, markup = render(uid, _tz(uid))
+        await update.message.reply_text(out, parse_mode="HTML", reply_markup=markup)
+        return
+
+    if text == MENU_ADD:
+        await update.message.reply_text(
+            "➕ Просто напиши или надиктуй 🎤 задачу — например:\n"
+            "<i>завтра в 15 зал</i>. Можно несколько дел в одной фразе.",
+            parse_mode="HTML", reply_markup=build_menu(),
+        )
+        return
+
+    await process_free_text(update, context, text)
 
 
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -632,7 +727,8 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("birthdays", cmd_birthdays))
     app.add_handler(CommandHandler("done",  cmd_done))
 
-    # Нажатия кнопок 🗑 удаления
+    # Нажатия кнопок: ✅ выполнено и 🗑 удаление
+    app.add_handler(CallbackQueryHandler(on_done_button, pattern=r"^done:"))
     app.add_handler(CallbackQueryHandler(on_delete_button, pattern=r"^del:"))
 
     # Свободный текст и голос — после команд, чтобы не перехватывать /команды

@@ -74,6 +74,10 @@ def init_db(owner_id: int = None):
     if "user_id" not in columns:
         conn.execute("ALTER TABLE reminders ADD COLUMN user_id INTEGER")
 
+    # Колонка времени выполнения (для счётчика «закрыто за сегодня»).
+    if "done_at" not in columns:
+        conn.execute("ALTER TABLE reminders ADD COLUMN done_at TEXT")
+
     # Любые осиротевшие задачи (user_id IS NULL) отдаём владельцу, чтобы не потерять.
     if owner_id is not None:
         conn.execute("UPDATE reminders SET user_id = ? WHERE user_id IS NULL", (owner_id,))
@@ -173,17 +177,31 @@ def get_all_active_reminders():
     return rows
 
 
-def mark_done(user_id: int, reminder_id: int) -> bool:
-    """Помечает напоминание пользователя выполненным. True, если нашлось и обновилось."""
+def mark_done(user_id: int, reminder_id: int, done_at: str = None) -> bool:
+    """
+    Помечает напоминание пользователя выполненным и запоминает время (done_at,
+    строка 'YYYY-MM-DD HH:MM' в местном времени). True, если нашлось и обновилось.
+    """
     conn = get_connection()
     cursor = conn.execute(
-        "UPDATE reminders SET done = 1 WHERE id = ? AND user_id = ? AND done = 0",
-        (reminder_id, user_id),
+        "UPDATE reminders SET done = 1, done_at = ? WHERE id = ? AND user_id = ? AND done = 0",
+        (done_at, reminder_id, user_id),
     )
     conn.commit()
     updated = cursor.rowcount > 0
     conn.close()
     return updated
+
+
+def count_done_on(user_id: int, day_iso: str) -> int:
+    """Сколько задач пользователь закрыл в указанный день (day_iso = 'YYYY-MM-DD')."""
+    conn = get_connection()
+    row = conn.execute(
+        "SELECT COUNT(*) AS c FROM reminders WHERE user_id = ? AND done = 1 AND done_at LIKE ?",
+        (user_id, day_iso + "%"),
+    ).fetchone()
+    conn.close()
+    return row["c"]
 
 
 def delete_reminder(user_id: int, reminder_id: int) -> bool:
