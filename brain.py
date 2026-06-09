@@ -15,12 +15,26 @@ import json
 import os
 import time
 from datetime import datetime
+from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
 
-# TZ — единый часовой пояс проекта (Asia/Makassar, UTC+8). Берём из scheduler,
-# чтобы не плодить копии. scheduler ничего из brain не импортирует — цикла нет.
+# TZ по умолчанию (Asia/Makassar). Берём из scheduler, чтобы не плодить копии.
+# scheduler ничего из brain не импортирует — цикла нет. Но теперь разбор идёт
+# в ЛИЧНОЙ таймзоне пользователя — её передают в parse_message(text, tz).
 from scheduler import TZ
+
+
+def _as_tz(tz):
+    """Строку IANA или ZoneInfo приводит к ZoneInfo (дефолт — TZ)."""
+    if tz is None:
+        return TZ
+    if isinstance(tz, str):
+        try:
+            return ZoneInfo(tz)
+        except Exception:
+            return TZ
+    return tz
 
 load_dotenv()
 
@@ -136,16 +150,17 @@ def _call_gemini(text: str, now: datetime, model: str) -> str:
     return response.text or ""
 
 
-def parse_message(text: str) -> list:
+def parse_message(text: str, tz=None) -> list:
     """
     Отправляет фразу в Gemini и возвращает список действий (list[dict]).
-    Пустой список — нечего делать или не понял. При ошибке сети/разбора
-    бросает исключение — бот ловит его и просит переформулировать.
+    tz — таймзона пользователя (строка IANA или ZoneInfo); от неё считаются
+    «сегодня/завтра/через час». Пустой список — нечего делать или не понял.
+    При ошибке сети/разбора бросает исключение — бот просит переформулировать.
 
     Устойчивость к 503 (перегрузка Gemini): несколько попыток на основную модель
     с нарастающей паузой, затем переключение на запасную модель.
     """
-    now = datetime.now(TZ)
+    now = datetime.now(_as_tz(tz))
 
     # План попыток: (модель, номер попытки) — основная, потом запасная.
     plan = [(m, a) for m in _MODELS for a in range(_ATTEMPTS_PER_MODEL)]

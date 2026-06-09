@@ -3,6 +3,7 @@ import os
 import re
 import tempfile
 from datetime import datetime, timedelta, date
+from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -11,8 +12,9 @@ from telegram.ext import (
 )
 
 from database import (
-    init_db, add_reminder, get_active_reminders, mark_done,
+    init_db, add_reminder, get_active_reminders, get_all_active_reminders, mark_done,
     delete_reminder, get_reminder_by_id, update_reminder_time,
+    ensure_user, get_user_timezone,
 )
 from scheduler import scheduler, schedule_reminder, reschedule_all, unschedule_reminder, TZ
 from stt import transcribe
@@ -25,8 +27,19 @@ MY_CHAT_ID = int(os.getenv("MY_CHAT_ID"))
 
 
 def is_owner(update: Update) -> bool:
-    """Проверяет, что команду отправил именно я, а не кто-то чужой."""
+    """Проверяет, что команду отправил именно я, а не кто-то чужой.
+
+    Пока бот персональный — пускаем только владельца. Когда откроем продукт
+    для всех, эту проверку снимем (схема БД уже многопользовательская)."""
     return update.effective_user.id == MY_CHAT_ID
+
+
+def _tz(user_id: int) -> ZoneInfo:
+    """Личная таймзона пользователя как ZoneInfo (дефолт — TZ при ошибке)."""
+    try:
+        return ZoneInfo(get_user_timezone(user_id))
+    except Exception:
+        return TZ
 
 
 # ───────────────────────── Эмодзи по смыслу задачи ──────────────────────────
@@ -46,22 +59,22 @@ def pick_emoji(text: str) -> str:
 
 # ───────────────────────── Подписи дат/времени ──────────────────────────
 
-def format_date(d: date) -> str:
+def format_date(d: date, tz: ZoneInfo) -> str:
     """Дата для вывода: '15.06' или '15.06.2027' если год не текущий."""
-    today = datetime.now(TZ).date()
+    today = datetime.now(tz).date()
     return d.strftime("%d.%m.%Y") if d.year != today.year else d.strftime("%d.%m")
 
 
-def format_when(dt: datetime) -> str:
+def format_when(dt: datetime, tz: ZoneInfo) -> str:
     """Человеческая подпись момента: 'сегодня в 11:00' / 'завтра ...' / '15.06 в 10:00'."""
-    today = datetime.now(TZ).date()
+    today = datetime.now(tz).date()
     d = dt.date()
     if d == today:
         prefix = "сегодня"
     elif d == today + timedelta(days=1):
         prefix = "завтра"
     else:
-        prefix = format_date(d)
+        prefix = format_date(d, tz)
     return f"{prefix} в {dt.strftime('%H:%M')}"
 
 
@@ -89,8 +102,8 @@ MATCH_STOP_WORDS = {
 }
 
 
-def find_matches(query: str):
-    """Ищет активные напоминания, чьё название похоже на описание из действия."""
+def find_matches(query: str, user_id: int):
+    """Ищет активные напоминания пользователя, чьё название похоже на описание."""
     qtokens = [
         w for w in re.findall(r"[а-яёa-z0-9]+", query.lower())
         if w not in MATCH_STOP_WORDS and len(w) >= 3
@@ -99,7 +112,7 @@ def find_matches(query: str):
         return []
 
     matches = []
-    for r in get_active_reminders():
+    for r in get_active_reminders(user_id):
         ttokens = re.findall(r"[а-яёa-z0-9]+", r["text"].lower())
         # совпадение по началу слова (4 буквы) — ловит «зал», «встречу»~«встреча» и т.п.
         if any(any(tt.startswith(qt[:4]) or qt.startswith(tt[:4]) for tt in ttokens) for qt in qtokens):
@@ -118,7 +131,7 @@ def _match_label(r) -> str:
 
 # ───────────────────────── Выполнение действий от Gemini ──────────────────────────
 
-def _do_task(context, action: dict) -> str:
+def _do_task(context, action: dict, user_id: int, tz: ZoneInfo) -> str:
     """Добавляет разовую задачу. Возвращает строку отчёта."""
     text = (action.get("text") or "").strip()
     dt_str = action.get("datetime")
@@ -130,16 +143,16 @@ def _do_task(context, action: dict) -> str:
         return f"⚠️ Пропустил «{text}» — не понял время."
 
     remind_at = dt.strftime("%Y-%m-%d %H:%M")
-    rid = add_reminder(text, remind_at, "none")
-    scheduled = schedule_reminder(context.bot, MY_CHAT_ID, rid, text, remind_at, "none")
+    rid = add_reminder(user_id, text, remind_at, "none")
+    scheduled = schedule_reminder(context.bot, user_id, rid, text, remind_at, "none", tz=tz)
 
-    line = f"✅ Добавил: {pick_emoji(text)} {text} — {format_when(dt)}"
+    line = f"✅ Добавил: {pick_emoji(text)} {text} — {format_when(dt, tz)}"
     if not scheduled:
         line += " <i>(время уже прошло — напоминания не будет)</i>"
     return line
 
 
-def _do_birthday(context, action: dict) -> str:
+def _do_birthday(context, action: dict, user_id: int, tz: ZoneInfo) -> str:
     """Запоминает день рождения (ежегодно). Возвращает строку отчёта."""
     name = (action.get("name") or action.get("text") or "").strip()
     date_str = action.get("date")
@@ -152,20 +165,20 @@ def _do_birthday(context, action: dict) -> str:
         return f"⚠️ Пропустил ДР «{name}» — не понял дату."
 
     remind_at = f"2024-{month:02d}-{day:02d} 09:00"
-    rid = add_reminder(name, remind_at, "yearly")
-    schedule_reminder(context.bot, MY_CHAT_ID, rid, name, remind_at, "yearly")
+    rid = add_reminder(user_id, name, remind_at, "yearly")
+    schedule_reminder(context.bot, user_id, rid, name, remind_at, "yearly", tz=tz)
     return f"✅ Запомнил ДР: 🎂 {name} — {ru_day_month(d)} <i>(напомню за 2 дня и утром)</i>"
 
 
-def _do_delete(action: dict, pending_buttons: list) -> str:
-    """Удаляет задачу по описанию. Несколько похожих → кладёт кнопки в pending_buttons."""
+def _do_delete(action: dict, user_id: int, pending_buttons: list) -> str:
+    """Удаляет задачу по описанию. Несколько похожих → кнопки в pending_buttons."""
     query = (action.get("text") or "").strip()
-    matches = find_matches(query)
+    matches = find_matches(query, user_id)
     if not matches:
         return f"🤷 Не нашёл, что удалить: «{query}»"
     if len(matches) == 1:
         r = matches[0]
-        delete_reminder(r["id"])
+        delete_reminder(user_id, r["id"])
         unschedule_reminder(r["id"])
         return f"🗑 Удалил: {r['text']}"
     items = [("list", r["id"], _match_label(r)) for r in matches]
@@ -173,7 +186,7 @@ def _do_delete(action: dict, pending_buttons: list) -> str:
     return None  # отчёт не нужен, будут кнопки
 
 
-def _do_reschedule(context, action: dict) -> str:
+def _do_reschedule(context, action: dict, user_id: int, tz: ZoneInfo) -> str:
     """Переносит существующую задачу на новое время. Возвращает строку отчёта."""
     query = (action.get("text") or "").strip()
     dt_str = action.get("datetime")
@@ -184,7 +197,7 @@ def _do_reschedule(context, action: dict) -> str:
     except (ValueError, TypeError):
         return f"⚠️ Не понял новое время для «{query}»."
 
-    matches = find_matches(query)
+    matches = find_matches(query, user_id)
     if not matches:
         return f"🤷 Не нашёл задачу для переноса: «{query}»"
     if len(matches) > 1:
@@ -192,20 +205,23 @@ def _do_reschedule(context, action: dict) -> str:
 
     r = matches[0]
     remind_at = dt.strftime("%Y-%m-%d %H:%M")
-    update_reminder_time(r["id"], remind_at)
+    update_reminder_time(user_id, r["id"], remind_at)
     unschedule_reminder(r["id"])
-    schedule_reminder(context.bot, MY_CHAT_ID, r["id"], r["text"], remind_at, r["recurrence"])
-    return f"🔄 Перенёс: {pick_emoji(r['text'])} {r['text']} → {format_when(dt)}"
+    schedule_reminder(context.bot, user_id, r["id"], r["text"], remind_at, r["recurrence"], tz=tz)
+    return f"🔄 Перенёс: {pick_emoji(r['text'])} {r['text']} → {format_when(dt, tz)}"
 
 
 async def process_free_text(update: Update, context, raw_text: str):
     """
-    Единый обработчик текста и голоса: отдаёт фразу Gemini, получает список
-    действий (task/birthday/delete/reschedule) и выполняет их, затем шлёт отчёт.
+    Единый обработчик текста и голоса: отдаёт фразу Gemini (в таймзоне юзера),
+    получает список действий (task/birthday/delete/reschedule), выполняет, шлёт отчёт.
     """
+    user_id = update.effective_user.id
+    tz = _tz(user_id)
+
     # Разбор — блокирующий сетевой вызов, уносим в поток, чтобы не подвешивать бота.
     try:
-        actions = await asyncio.to_thread(brain.parse_message, raw_text)
+        actions = await asyncio.to_thread(brain.parse_message, raw_text, tz)
     except Exception as e:
         print(f"[process_free_text] ошибка разбора: {e!r}")  # видно в логах Railway
         await update.message.reply_text("⚠️ Не понял, переформулируй")
@@ -221,15 +237,15 @@ async def process_free_text(update: Update, context, raw_text: str):
     for action in actions:
         kind = action.get("type")
         if kind == "task":
-            report.append(_do_task(context, action))
+            report.append(_do_task(context, action, user_id, tz))
         elif kind == "birthday":
-            report.append(_do_birthday(context, action))
+            report.append(_do_birthday(context, action, user_id, tz))
         elif kind == "delete":
-            line = _do_delete(action, pending_buttons)
+            line = _do_delete(action, user_id, pending_buttons)
             if line:
                 report.append(line)
         elif kind == "reschedule":
-            report.append(_do_reschedule(context, action))
+            report.append(_do_reschedule(context, action, user_id, tz))
 
     if report:
         await update.message.reply_text("\n".join(report), parse_mode="HTML")
@@ -244,6 +260,8 @@ async def process_free_text(update: Update, context, raw_text: str):
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_owner(update):
         return
+
+    ensure_user(update.effective_user.id)  # заводим пользователя с таймзоной по умолчанию
 
     await update.message.reply_text(
         "Привет! Я твой личный планер. ⏱ Время — по Бали (UTC+8).\n\n"
@@ -276,6 +294,8 @@ async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    user_id = update.effective_user.id
+    tz = _tz(user_id)
     time_str = context.args[0]
     text = " ".join(context.args[1:])
 
@@ -288,10 +308,10 @@ async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # /add ставит задачу на сегодня в указанное время.
-    today = datetime.now(TZ).date()
+    today = datetime.now(tz).date()
     remind_at = f"{today.isoformat()} {time_str}"
-    reminder_id = add_reminder(text, remind_at)
-    scheduled = schedule_reminder(context.bot, MY_CHAT_ID, reminder_id, text, remind_at)
+    reminder_id = add_reminder(user_id, text, remind_at)
+    scheduled = schedule_reminder(context.bot, user_id, reminder_id, text, remind_at, tz=tz)
 
     if scheduled:
         await update.message.reply_text(f"✅ Добавлено: [{time_str}] {text}")
@@ -359,10 +379,10 @@ def _next_birthday(r, today: date) -> date:
     return today
 
 
-def render_today():
-    today = datetime.now(TZ).date()
+def render_today(user_id: int, tz: ZoneInfo):
+    today = datetime.now(tz).date()
     rows = [
-        r for r in get_active_reminders()
+        r for r in get_active_reminders(user_id)
         if r["recurrence"] == "none" and datetime.fromisoformat(r["remind_at"]).date() == today
     ]
     if not rows:
@@ -379,11 +399,11 @@ def render_today():
     return f"📋 <b>Задачи на сегодня:</b>\n\n{body}", _delete_keyboard(items)
 
 
-def render_week():
-    today = datetime.now(TZ).date()
+def render_week(user_id: int, tz: ZoneInfo):
+    today = datetime.now(tz).date()
     end = today + timedelta(days=6)  # сегодня + 6 дней = 7 дней всего
     rows = [
-        r for r in get_active_reminders()
+        r for r in get_active_reminders(user_id)
         if r["recurrence"] == "none"
         and today <= datetime.fromisoformat(r["remind_at"]).date() <= end
     ]
@@ -411,8 +431,8 @@ def render_week():
     return f"🗓 <b>Задачи на неделю:</b>\n\n{body}", _delete_keyboard(items)
 
 
-def render_list():
-    reminders = [r for r in get_active_reminders() if r["recurrence"] == "none"]
+def render_list(user_id: int, tz: ZoneInfo):
+    reminders = [r for r in get_active_reminders(user_id) if r["recurrence"] == "none"]
     if not reminders:
         return "✨ Задач нет. Просто напиши, что и когда напомнить.", None
 
@@ -420,18 +440,18 @@ def render_list():
     blocks, items = [], []
     for i, r in enumerate(reminders, 1):
         dt = datetime.fromisoformat(r["remind_at"])
-        blocks.append(f"{i}. {pick_emoji(r['text'])} {r['text']}\n   📅 <code>{format_when(dt)}</code>")
+        blocks.append(f"{i}. {pick_emoji(r['text'])} {r['text']}\n   📅 <code>{format_when(dt, tz)}</code>")
         items.append(("list", r["id"], f"{dt:%d.%m %H:%M} {r['text']}"))
     body = "\n\n".join(blocks)
     return f"📋 <b>Все задачи:</b>\n\n{body}", _delete_keyboard(items)
 
 
-def render_birthdays():
-    bdays = [r for r in get_active_reminders() if r["recurrence"] == "yearly"]
+def render_birthdays(user_id: int, tz: ZoneInfo):
+    bdays = [r for r in get_active_reminders(user_id) if r["recurrence"] == "yearly"]
     if not bdays:
         return "🎂 Дней рождения пока нет.\nДобавь, например: ДР мамы 20 августа", None
 
-    today = datetime.now(TZ).date()
+    today = datetime.now(tz).date()
     bdays.sort(key=lambda r: _next_birthday(r, today))  # ближайший — сверху
 
     blocks, items = [], []
@@ -462,50 +482,55 @@ RENDERERS = {
 async def cmd_today(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_owner(update):
         return
-    text, markup = render_today()
+    uid = update.effective_user.id
+    text, markup = render_today(uid, _tz(uid))
     await update.message.reply_text(text, parse_mode="HTML", reply_markup=markup)
 
 
 async def cmd_week(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_owner(update):
         return
-    text, markup = render_week()
+    uid = update.effective_user.id
+    text, markup = render_week(uid, _tz(uid))
     await update.message.reply_text(text, parse_mode="HTML", reply_markup=markup)
 
 
 async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_owner(update):
         return
-    text, markup = render_list()
+    uid = update.effective_user.id
+    text, markup = render_list(uid, _tz(uid))
     await update.message.reply_text(text, parse_mode="HTML", reply_markup=markup)
 
 
 async def cmd_birthdays(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_owner(update):
         return
-    text, markup = render_birthdays()
+    uid = update.effective_user.id
+    text, markup = render_birthdays(uid, _tz(uid))
     await update.message.reply_text(text, parse_mode="HTML", reply_markup=markup)
 
 
 async def on_delete_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Нажата кнопка 🗑: удаляем задачу и перерисовываем тот же список."""
     query = update.callback_query
-    if update.effective_user.id != MY_CHAT_ID:
+    uid = update.effective_user.id
+    if uid != MY_CHAT_ID:
         await query.answer()
         return
 
     _, view, rid = query.data.split(":")
     rid = int(rid)
-    row = get_reminder_by_id(rid)
+    row = get_reminder_by_id(uid, rid)
 
-    delete_reminder(rid)
+    delete_reminder(uid, rid)
     unschedule_reminder(rid)
 
     await query.answer("Удалено 🗑" if row else "Уже удалено")
 
     # Перерисовываем тот же список без удалённой задачи.
     render = RENDERERS.get(view, render_list)
-    text, markup = render()
+    text, markup = render(uid, _tz(uid))
     await query.edit_message_text(text, parse_mode="HTML", reply_markup=markup)
 
 
@@ -523,7 +548,7 @@ async def cmd_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Номер должен быть числом, например: /done 3")
         return
 
-    success = mark_done(reminder_id)
+    success = mark_done(update.effective_user.id, reminder_id)
     if success:
         await update.message.reply_text(f"✅ Напоминание #{reminder_id} выполнено!")
     else:
@@ -583,13 +608,13 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def on_startup(application: Application):
     scheduler.start()
-    reminders = get_active_reminders()
-    reschedule_all(application.bot, MY_CHAT_ID, reminders)
+    reminders = get_all_active_reminders()       # напоминания всех пользователей
+    reschedule_all(application.bot, reminders)
     print(f"Восстановлено напоминаний из базы: {len(reminders)}")
 
 
 if __name__ == "__main__":
-    init_db()
+    init_db(MY_CHAT_ID)  # передаём владельца: старые задачи привяжутся к нему
 
     app = (
         Application.builder()
