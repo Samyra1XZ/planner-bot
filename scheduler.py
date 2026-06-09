@@ -2,6 +2,7 @@ from datetime import datetime, timedelta, date
 from zoneinfo import ZoneInfo
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
 from database import DEFAULT_TZ, get_user_timezone
 
@@ -29,9 +30,22 @@ def _as_tz(tz):
     return tz
 
 
-async def _send_reminder(bot, chat_id: int, text: str):
+def _reminder_keyboard(reminder_id: int) -> InlineKeyboardMarkup:
+    """Кнопки под напоминанием: отметить готовым или отложить на 10/30/60 минут."""
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ Готово", callback_data=f"done:remind:{reminder_id}"),
+        InlineKeyboardButton("⏰ +10", callback_data=f"snooze:{reminder_id}:10"),
+        InlineKeyboardButton("⏰ +30", callback_data=f"snooze:{reminder_id}:30"),
+        InlineKeyboardButton("⏰ +60", callback_data=f"snooze:{reminder_id}:60"),
+    ]])
+
+
+async def _send_reminder(bot, chat_id: int, text: str,
+                         reminder_id: int = None, with_actions: bool = False):
     # Планировщик вызывает эту функцию автоматически — text уже содержит нужный префикс.
-    await bot.send_message(chat_id=chat_id, text=text)
+    # with_actions=True — прикрепляем кнопки «Готово/Отложить» (для основного напоминания).
+    markup = _reminder_keyboard(reminder_id) if (with_actions and reminder_id is not None) else None
+    await bot.send_message(chat_id=chat_id, text=text, reply_markup=markup)
 
 
 def _schedule_yearly(bot, chat_id: int, reminder_id: int, text: str, dt: datetime, tz) -> bool:
@@ -79,12 +93,13 @@ def schedule_reminder(bot, chat_id: int, reminder_id: int, text: str,
     if dt <= now:
         return False
 
-    # Основное напоминание — в точное время
+    # Основное напоминание — в точное время, с кнопками «Готово/Отложить»
     scheduler.add_job(
         _send_reminder,
         trigger="date",
         run_date=dt,
         args=[bot, chat_id, f"🔔 Сейчас: {text}"],
+        kwargs={"reminder_id": reminder_id, "with_actions": True},
         id=str(reminder_id),
         replace_existing=True,
     )

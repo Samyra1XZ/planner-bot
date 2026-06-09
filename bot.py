@@ -1,6 +1,7 @@
 import asyncio
 import os
 import re
+import secrets
 import tempfile
 from datetime import datetime, timedelta, date
 from zoneinfo import ZoneInfo
@@ -233,10 +234,100 @@ def _do_reschedule(context, action: dict, user_id: int, tz: ZoneInfo) -> str:
     return f"🔄 Перенёс: {pick_emoji(r['text'])} {r['text']} → {format_when(dt, tz)}"
 
 
+# Ожидающие подтверждения разборы: token → {"user_id", "actions"}.
+# В памяти (теряется при рестарте — это нормально, подтверждение транзиентное).
+# Небольшая утечка, если юзер не жмёт кнопки; для личного бота некритично.
+_PENDING_CONFIRM = {}
+
+
+def _execute_actions(context, actions: list, user_id: int, tz: ZoneInfo):
+    """
+    Выполняет список действий (task/birthday/delete/reschedule).
+    Возвращает (report_lines, pending_buttons) — строки отчёта и неоднозначные
+    удаления, требующие выбора кнопкой.
+    """
+    report = []
+    pending_buttons = []
+    for action in actions:
+        kind = action.get("type")
+        if kind == "task":
+            report.append(_do_task(context, action, user_id, tz))
+        elif kind == "birthday":
+            report.append(_do_birthday(context, action, user_id, tz))
+        elif kind == "delete":
+            line = _do_delete(action, user_id, pending_buttons)
+            if line:
+                report.append(line)
+        elif kind == "reschedule":
+            report.append(_do_reschedule(context, action, user_id, tz))
+    return report, pending_buttons
+
+
+def _preview_actions(actions: list, user_id: int, tz: ZoneInfo) -> str:
+    """
+    Человекочитаемое превью того, что бот СОБИРАЕТСЯ сделать — БЕЗ изменения базы.
+    Для delete/reschedule использует read-only find_matches, чтобы показать цель.
+    """
+    lines = []
+    for a in actions:
+        kind = a.get("type")
+        if kind == "task":
+            text = (a.get("text") or "").strip()
+            try:
+                dt = _parse_dt(a.get("datetime"))
+                lines.append(f"➕ {pick_emoji(text)} {text} — {format_when(dt, tz)}")
+            except (ValueError, TypeError):
+                lines.append(f"⚠️ задача «{text}» — не понял время")
+        elif kind == "birthday":
+            name = (a.get("name") or a.get("text") or "").strip()
+            try:
+                month, day = _parse_bday(a.get("date"))
+                lines.append(f"🎂 ДР {name} — {ru_day_month(date(2024, month, day))}")
+            except (ValueError, TypeError):
+                lines.append(f"⚠️ ДР «{name}» — не понял дату")
+        elif kind == "delete":
+            q = (a.get("text") or "").strip()
+            matches = find_matches(q, user_id)
+            if not matches:
+                lines.append(f"🤷 удалить «{q}» — не нашёл")
+            elif len(matches) == 1:
+                lines.append(f"🗑 удалить: {matches[0]['text']}")
+            else:
+                lines.append(f"🗑 удалить «{q}» — несколько, выберу при подтверждении")
+        elif kind == "reschedule":
+            q = (a.get("text") or "").strip()
+            try:
+                when = format_when(_parse_dt(a.get("datetime")), tz)
+            except (ValueError, TypeError):
+                when = "?"
+            matches = find_matches(q, user_id)
+            if not matches:
+                lines.append(f"🤷 перенести «{q}» — не нашёл")
+            elif len(matches) == 1:
+                lines.append(f"🔄 перенести: {matches[0]['text']} → {when}")
+            else:
+                lines.append(f"🔄 перенести «{q}» — несколько похожих")
+
+    body = "\n".join(f"• {line}" for line in lines)
+    return f"🤔 Понял так — всё верно?\n\n{body}"
+
+
+async def _send_results(send, report, pending_buttons):
+    """Отправляет отчёт (с меню) и сообщения выбора для неоднозначных удалений.
+
+    send — корутина-отправитель вида send(text, **kwargs) (reply или bot.send_message)."""
+    if report:
+        await send("\n".join(report), parse_mode="HTML", reply_markup=build_menu())
+    for prompt, items in pending_buttons:
+        await send(prompt, reply_markup=_item_keyboard(items, with_done=False))
+
+
 async def process_free_text(update: Update, context, raw_text: str):
     """
     Единый обработчик текста и голоса: отдаёт фразу Gemini (в таймзоне юзера),
-    получает список действий (task/birthday/delete/reschedule), выполняет, шлёт отчёт.
+    получает список действий. Сложные/рисковые (несколько действий или
+    удаление/перенос) сначала показываем на подтверждение; одиночное добавление —
+    сразу.
     """
     user_id = update.effective_user.id
     tz = _tz(user_id)
@@ -253,31 +344,26 @@ async def process_free_text(update: Update, context, raw_text: str):
         await update.message.reply_text("⚠️ Не понял, переформулируй")
         return
 
-    report = []                 # строки отчёта о выполненном
-    pending_buttons = []        # (текст, items) для неоднозначных удалений
+    # Подтверждение нужно, если действий несколько ИЛИ есть удаление/перенос.
+    needs_confirm = len(actions) > 1 or any(
+        a.get("type") in ("delete", "reschedule") for a in actions
+    )
 
-    for action in actions:
-        kind = action.get("type")
-        if kind == "task":
-            report.append(_do_task(context, action, user_id, tz))
-        elif kind == "birthday":
-            report.append(_do_birthday(context, action, user_id, tz))
-        elif kind == "delete":
-            line = _do_delete(action, user_id, pending_buttons)
-            if line:
-                report.append(line)
-        elif kind == "reschedule":
-            report.append(_do_reschedule(context, action, user_id, tz))
-
-    if report:
-        # К отчёту прикрепляем нижнее меню — так оно всегда под рукой.
+    if needs_confirm:
+        token = secrets.token_urlsafe(6)
+        _PENDING_CONFIRM[token] = {"user_id": user_id, "actions": actions}
+        keyboard = InlineKeyboardMarkup([[
+            InlineKeyboardButton("✅ Принять", callback_data=f"ok:{token}"),
+            InlineKeyboardButton("↩️ Отменить", callback_data=f"no:{token}"),
+        ]])
         await update.message.reply_text(
-            "\n".join(report), parse_mode="HTML", reply_markup=build_menu()
+            _preview_actions(actions, user_id, tz), parse_mode="HTML", reply_markup=keyboard
         )
+        return
 
-    # Неоднозначные удаления — отдельными сообщениями с кнопками выбора.
-    for prompt, items in pending_buttons:
-        await update.message.reply_text(prompt, reply_markup=_item_keyboard(items, with_done=False))
+    # Простой случай (одиночное добавление) — выполняем сразу.
+    report, pending_buttons = _execute_actions(context, actions, user_id, tz)
+    await _send_results(update.message.reply_text, report, pending_buttons)
 
 
 # ───────────────────────── Обработчики команд ──────────────────────────
@@ -577,6 +663,73 @@ async def on_delete_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.edit_message_text(text, parse_mode="HTML", reply_markup=markup)
 
 
+async def on_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Нажато «✅ Принять» под превью: выполняем отложенные действия."""
+    query = update.callback_query
+    uid = update.effective_user.id
+    if uid != MY_CHAT_ID:
+        await query.answer()
+        return
+
+    _, token = query.data.split(":")
+    pending = _PENDING_CONFIRM.pop(token, None)
+    if not pending or pending["user_id"] != uid:
+        await query.answer("Уже неактуально")
+        return
+
+    tz = _tz(uid)
+    report, pending_buttons = _execute_actions(context, pending["actions"], uid, tz)
+    await query.answer("Сохранено ✅")
+
+    summary = "✅ Сохранено:\n" + "\n".join(report) if report else "✅ Готово"
+    await query.edit_message_text(summary, parse_mode="HTML")
+
+    # Неоднозначные удаления — отдельными сообщениями с кнопками выбора.
+    for prompt, items in pending_buttons:
+        await context.bot.send_message(uid, prompt, reply_markup=_item_keyboard(items, with_done=False))
+
+
+async def on_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Нажато «↩️ Отменить» под превью: ничего не сохраняем."""
+    query = update.callback_query
+    uid = update.effective_user.id
+    if uid != MY_CHAT_ID:
+        await query.answer()
+        return
+
+    _, token = query.data.split(":")
+    _PENDING_CONFIRM.pop(token, None)
+    await query.answer("Отменено")
+    await query.edit_message_text("↩️ Отменено — ничего не сохранил.")
+
+
+async def on_snooze(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Нажато ⏰ под напоминанием: переносим задачу на +N минут от текущего момента."""
+    query = update.callback_query
+    uid = update.effective_user.id
+    if uid != MY_CHAT_ID:
+        await query.answer()
+        return
+
+    _, rid, minutes = query.data.split(":")
+    rid, minutes = int(rid), int(minutes)
+    tz = _tz(uid)
+
+    r = get_reminder_by_id(uid, rid)
+    if not r:
+        await query.answer("Задачи уже нет")
+        return
+
+    new_dt = datetime.now(tz) + timedelta(minutes=minutes)
+    remind_at = new_dt.strftime("%Y-%m-%d %H:%M")
+    update_reminder_time(uid, rid, remind_at)
+    unschedule_reminder(rid)
+    schedule_reminder(context.bot, uid, rid, r["text"], remind_at, r["recurrence"], tz=tz)
+
+    await query.answer(f"Отложил на {minutes} мин")
+    await query.edit_message_text(f"⏰ Отложено до {new_dt:%H:%M}: {r['text']}")
+
+
 async def on_done_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Нажата кнопка ✅: отмечаем выполненной, показываем счётчик за день, перерисовываем."""
     query = update.callback_query
@@ -593,13 +746,16 @@ async def on_done_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ok = mark_done(uid, rid, now.strftime("%Y-%m-%d %H:%M"))
     unschedule_reminder(rid)  # снимаем запланированные напоминания закрытой задачи
 
-    if ok:
-        done_today = count_done_on(uid, now.date().isoformat())
-        await query.answer(f"Готово ✅  ({done_today} за сегодня)")
-    else:
-        await query.answer("Уже закрыто")
+    done_today = count_done_on(uid, now.date().isoformat()) if ok else None
+    await query.answer(f"Готово ✅  ({done_today} за сегодня)" if ok else "Уже закрыто")
 
-    # Перерисовываем тот же список без закрытой задачи.
+    # Нажато прямо из напоминания (не из списка) — просто отмечаем сообщение.
+    if view == "remind":
+        suffix = f"  ({done_today} за сегодня)" if ok else ""
+        await query.edit_message_text(f"✅ Выполнено{suffix}")
+        return
+
+    # Иначе это список — перерисовываем его без закрытой задачи.
     render = RENDERERS.get(view, render_list)
     text, markup = render(uid, tz)
     await query.edit_message_text(text, parse_mode="HTML", reply_markup=markup)
@@ -727,7 +883,10 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("birthdays", cmd_birthdays))
     app.add_handler(CommandHandler("done",  cmd_done))
 
-    # Нажатия кнопок: ✅ выполнено и 🗑 удаление
+    # Нажатия кнопок: подтверждение разбора, снуз, ✅ выполнено, 🗑 удаление
+    app.add_handler(CallbackQueryHandler(on_confirm, pattern=r"^ok:"))
+    app.add_handler(CallbackQueryHandler(on_cancel, pattern=r"^no:"))
+    app.add_handler(CallbackQueryHandler(on_snooze, pattern=r"^snooze:"))
     app.add_handler(CallbackQueryHandler(on_done_button, pattern=r"^done:"))
     app.add_handler(CallbackQueryHandler(on_delete_button, pattern=r"^del:"))
 
