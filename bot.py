@@ -206,7 +206,8 @@ async def process_free_text(update: Update, context, raw_text: str):
     # Разбор — блокирующий сетевой вызов, уносим в поток, чтобы не подвешивать бота.
     try:
         actions = await asyncio.to_thread(brain.parse_message, raw_text)
-    except Exception:
+    except Exception as e:
+        print(f"[process_free_text] ошибка разбора: {e!r}")  # видно в логах Railway
         await update.message.reply_text("⚠️ Не понял, переформулируй")
         return
 
