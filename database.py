@@ -118,6 +118,22 @@ def delete_reminder(reminder_id: int) -> bool:
     return deleted
 
 
+def update_reminder_time(reminder_id: int, remind_at: str) -> bool:
+    """
+    Меняет время напоминания (для переноса задачи). remind_at — ISO 'YYYY-MM-DD HH:MM'.
+    Возвращает True, если запись нашлась и обновилась.
+    """
+    conn = get_connection()
+    cursor = conn.execute(
+        "UPDATE reminders SET remind_at = ? WHERE id = ?",
+        (remind_at, reminder_id),
+    )
+    conn.commit()
+    updated = cursor.rowcount > 0
+    conn.close()
+    return updated
+
+
 def get_reminder_by_id(reminder_id: int):
     """Возвращает одно напоминание по id (или None, если не нашли)."""
     conn = get_connection()

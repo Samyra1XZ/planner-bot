@@ -12,10 +12,11 @@ from telegram.ext import (
 
 from database import (
     init_db, add_reminder, get_active_reminders, mark_done,
-    delete_reminder, get_reminder_by_id,
+    delete_reminder, get_reminder_by_id, update_reminder_time,
 )
 from scheduler import scheduler, schedule_reminder, reschedule_all, unschedule_reminder, TZ
 from stt import transcribe
+import brain  # «мозг» разбора на Gemini
 
 # Загружаем переменные из файла .env (BOT_TOKEN, MY_CHAT_ID)
 load_dotenv()
@@ -28,7 +29,7 @@ def is_owner(update: Update) -> bool:
     return update.effective_user.id == MY_CHAT_ID
 
 
-# ───────────────────────── Вспомогательные функции ──────────────────────────
+# ───────────────────────── Эмодзи по смыслу задачи ──────────────────────────
 
 def pick_emoji(text: str) -> str:
     t = text.lower()
@@ -43,244 +44,7 @@ def pick_emoji(text: str) -> str:
     return "📌"
 
 
-# Служебные слова, которые человек говорит вокруг задачи, но в списке они не нужны.
-FILLER_WORDS = {
-    "запланируй", "запланировать", "напомни", "напомнить", "поставь", "поставить",
-    "добавь", "добавить", "создай", "создать", "запиши", "записать", "сделай",
-    "надо", "нужно", "мне", "себе", "пожалуйста", "плиз",
-}
-
-# Слова-даты: в названии задачи они не нужны (дату вытащит extract_date отдельно).
-DATE_WORDS = {
-    "сегодня", "завтра", "послезавтра", "сейчас", "нынче", "утром", "днём", "днем",
-    "вечером", "ночью", "понедельник", "вторник", "среду", "четверг", "пятницу",
-    "субботу", "воскресенье",
-}
-
-# Предлоги, которые отрезаем по краям задачи (в середине не трогаем — «позвонить в банк»).
-EDGE_PREPOSITIONS = {"на", "в", "о", "об", "про", "к"}
-
-# Нормализация частых разговорных сокращений до нормального вида.
-ABBREVIATIONS = {
-    "треню": "тренировка", "треня": "тренировка", "тренька": "тренировка",
-    "тренеровка": "тренировка", "трени": "тренировка",
-}
-
-# Части суток для пересчёта «7 вечера» → 19:00 и т.п.
-def _apply_part_of_day(hour: int, part: str) -> int:
-    if part.startswith("веч"):                       # вечера → +12
-        return hour + 12 if hour < 12 else hour
-    if part.startswith("дн") or part.startswith("дня"):  # дня → +12 (кроме 12)
-        return hour + 12 if hour < 12 else hour
-    if part.startswith("ноч"):                       # 12 ночи → 0
-        return 0 if hour == 12 else hour
-    if part.startswith("утр"):                       # 12 утра → 0
-        return 0 if hour == 12 else hour
-    return hour
-
-
-def extract_time(text: str):
-    """
-    Достаёт время из русской фразы. Возвращает (hour, minute, (start, end))
-    с координатами найденного куска или None. Регистр не важен (длина строки
-    при .lower() не меняется, поэтому координаты подходят и к оригиналу).
-    """
-    t = text.lower()
-
-    # «через N часов / N минут» — относительное время от текущего момента
-    # (\w* доедает окончание слова: час/часа/часов, мин/минут)
-    m = re.search(r"через\s+(\d{1,2})\s*час\w*", t)
-    if m:
-        base = datetime.now(TZ) + timedelta(hours=int(m.group(1)))
-        return base.hour, base.minute, m.span()
-    m = re.search(r"через\s+(\d{1,3})\s*мин\w*", t)
-    if m:
-        base = datetime.now(TZ) + timedelta(minutes=int(m.group(1)))
-        return base.hour, base.minute, m.span()
-
-    # Явное ЧЧ:ММ или ЧЧ.ММ
-    m = re.search(r"\b(\d{1,2})[:.](\d{2})\b", t)
-    if m and int(m.group(1)) < 24 and int(m.group(2)) < 60:
-        return int(m.group(1)), int(m.group(2)), m.span()
-
-    # «N [часов] утра/дня/вечера/ночи» — с частью суток
-    m = re.search(r"\b(\d{1,2})\s*(?:час(?:ов|а)?\s*)?(утра|утром|дня|днём|днем|вечера|вечером|ночи|ночью)\b", t)
-    if m and int(m.group(1)) <= 23:
-        return _apply_part_of_day(int(m.group(1)), m.group(2)) % 24, 0, m.span()
-
-    # «N часов» — 24-часовой формат без части суток
-    m = re.search(r"\b(\d{1,2})\s*час(?:ов|а)?\b", t)
-    if m and int(m.group(1)) < 24:
-        return int(m.group(1)), 0, m.span()
-
-    # «в N» — голое «в 8», «встреча в 9» (трактуем как N:00). Самый общий случай — в конце.
-    m = re.search(r"\bв\s+(\d{1,2})\b", t)
-    if m and int(m.group(1)) < 24:
-        return int(m.group(1)), 0, m.span()
-
-    # Полдень / полночь
-    m = re.search(r"полдень|полдня", t)
-    if m:
-        return 12, 0, m.span()
-    m = re.search(r"полноч", t)
-    if m:
-        return 0, 0, m.span()
-
-    return None
-
-
-def clean_task_text(text: str) -> str:
-    """
-    Превращает разговорную фразу в короткую задачу:
-    убирает служебные слова, слова-даты и краевые предлоги, нормализует
-    сокращения, ставит заглавную букву. 'запланируй на завтра треню' → 'Тренировка'.
-    """
-    words = []
-    for word in text.split():
-        bare = word.lower().strip(".,!?;:")
-        if bare in FILLER_WORDS or bare in DATE_WORDS:
-            continue  # выкидываем «запланируй», «завтра» и т.п.
-        words.append(ABBREVIATIONS.get(bare, word))
-
-    # Отрезаем предлоги по краям («на тренировка», «встреча в» → ...).
-    while words and words[0].lower().strip(".,!?;:") in EDGE_PREPOSITIONS:
-        words.pop(0)
-    while words and words[-1].lower().strip(".,!?;:") in EDGE_PREPOSITIONS:
-        words.pop()
-
-    cleaned = " ".join(words).strip(" ,.-—")
-    if cleaned:
-        cleaned = cleaned[0].upper() + cleaned[1:]
-    return cleaned
-
-
-# Месяцы (по основе слова, чтобы ловить «июня», «августа» и т.п.).
-# Порядок важен: «март» раньше «май», иначе «марта» уйдёт не туда.
-MONTH_STEMS = [
-    ("январ", 1), ("феврал", 2), ("март", 3), ("апрел", 4), ("май", 5), ("мая", 5),
-    ("июн", 6), ("июл", 7), ("август", 8), ("сентябр", 9), ("октябр", 10),
-    ("ноябр", 11), ("декабр", 12),
-]
-
-# Дни недели как точные шаблоны (понедельник=0 ... воскресенье=6).
-# «сред[ауы]» — чтобы не цеплять «средство» и т.п.
-WEEKDAY_PATTERNS = [
-    (r"понедельник\w*", 0), (r"вторник\w*", 1), (r"сред[ауы]\b", 2),
-    (r"четверг\w*", 3), (r"пятниц\w*", 4), (r"суббот\w*", 5), (r"воскресень\w*", 6),
-]
-
-# Признаки дня рождения / годовщины → ежегодное напоминание.
-BIRTHDAY_RE = re.compile(r"день\s+рождени\w*|днюх\w*|годовщин\w*|\bдр\b|\bд\.?\s?р\.?", re.IGNORECASE)
-
-
-def _month_from_word(word: str):
-    for stem, num in MONTH_STEMS:
-        if word.startswith(stem):
-            return num
-    return None
-
-
-def extract_date(text: str):
-    """
-    Достаёт дату из фразы. Возвращает (datetime.date, (start, end)) или None.
-    Понимает: 15.06.2026 / 15.06 / 15 июня [2026] / сегодня / завтра /
-    послезавтра / «в пятницу». Год не указан → этот год, а если дата уже
-    прошла — следующий (для разовых задач).
-    """
-    t = text.lower()
-    today = datetime.now(TZ).date()
-
-    def resolve_year(day, month, year=None):
-        if year is not None:
-            year = year + 2000 if year < 100 else year
-            return date(year, month, day)
-        d = date(today.year, month, day)
-        return d if d >= today else date(today.year + 1, month, day)
-
-    # 15.06 или 15.06.2026 (точка/слэш). Месяц 1–12, день 1–31 — иначе это не дата (а время).
-    m = re.search(r"\b(\d{1,2})[./](\d{1,2})(?:[./](\d{2,4}))?\b", t)
-    if m:
-        day, month = int(m.group(1)), int(m.group(2))
-        year = int(m.group(3)) if m.group(3) else None
-        if 1 <= month <= 12 and 1 <= day <= 31:
-            try:
-                return resolve_year(day, month, year), m.span()
-            except ValueError:
-                pass
-
-    # 15 июня [2026]
-    m = re.search(r"\b(\d{1,2})\s+([а-я]+)(?:\s+(\d{4}))?\b", t)
-    if m:
-        month = _month_from_word(m.group(2))
-        if month:
-            day = int(m.group(1))
-            year = int(m.group(3)) if m.group(3) else None
-            try:
-                return resolve_year(day, month, year), m.span()
-            except ValueError:
-                pass
-
-    # послезавтра / завтра / сегодня
-    m = re.search(r"послезавтра", t)
-    if m:
-        return today + timedelta(days=2), m.span()
-    m = re.search(r"завтра", t)
-    if m:
-        return today + timedelta(days=1), m.span()
-    m = re.search(r"сегодня", t)
-    if m:
-        return today, m.span()
-
-    # «в пятницу» / «понедельник» → ближайший такой день недели
-    for pattern, wd in WEEKDAY_PATTERNS:
-        m = re.search(r"\b" + pattern, t)
-        if m:
-            ahead = (wd - today.weekday()) % 7
-            ahead = ahead or 7  # сегодня этот день → берём следующий такой
-            return today + timedelta(days=ahead), m.span()
-
-    return None
-
-
-def _blank(text: str, span) -> str:
-    """Заменяет найденный кусок пробелами (длина строки сохраняется)."""
-    start, end = span
-    return text[:start] + " " * (end - start) + text[end:]
-
-
-def parse_when(text: str) -> dict:
-    """
-    Разбирает фразу в структуру:
-      {recurrence, date, time, task}
-    recurrence: 'none' | 'yearly' (день рождения)
-    date: datetime.date | None
-    time: (hour, minute) | None
-    task: очищенное название
-    """
-    recurrence = "yearly" if BIRTHDAY_RE.search(text) else "none"
-
-    work = text
-    # Сначала дату (чтобы «15.06» не утащил разбор времени), потом время.
-    date_found = extract_date(work)
-    the_date = None
-    if date_found is not None:
-        the_date, span = date_found
-        work = _blank(work, span)
-
-    time_found = extract_time(work)
-    the_time = None
-    if time_found is not None:
-        hour, minute, span = time_found
-        the_time = (hour, minute)
-        work = _blank(work, span)
-
-    # Убираем сам маркер «день рождения / ДР» из названия
-    for m in BIRTHDAY_RE.finditer(work):
-        work = _blank(work, m.span())
-
-    task = clean_task_text(work) or clean_task_text(text)
-    return {"recurrence": recurrence, "date": the_date, "time": the_time, "task": task}
-
+# ───────────────────────── Подписи дат/времени ──────────────────────────
 
 def format_date(d: date) -> str:
     """Дата для вывода: '15.06' или '15.06.2027' если год не текущий."""
@@ -301,58 +65,35 @@ def format_when(dt: datetime) -> str:
     return f"{prefix} в {dt.strftime('%H:%M')}"
 
 
-async def _create_reminder(update, context, task, d: date, hm, recurrence, rolled=False):
-    """Сохраняет напоминание в базу, ставит в планировщик и отвечает пользователю."""
-    dt = datetime(d.year, d.month, d.day, hm[0], hm[1])
-    remind_at = dt.strftime("%Y-%m-%d %H:%M")
-    reminder_id = add_reminder(task, remind_at, recurrence)
-    scheduled = schedule_reminder(context.bot, MY_CHAT_ID, reminder_id, task, remind_at, recurrence)
-
-    if recurrence == "yearly":
-        await update.message.reply_text(
-            f"✅ Запомнил день рождения:\n🎂 {task} — {format_date(d)} "
-            f"<i>(ежегодно: напомню за 2 дня и утром в день)</i>",
-            parse_mode="HTML",
-        )
-        return
-
-    if scheduled:
-        extra = " <i>(перенёс на завтра — сегодня это время уже прошло)</i>" if rolled else ""
-        await update.message.reply_text(
-            f"✅ Понял! Напомню {format_when(dt)}:\n{pick_emoji(task)} {task}{extra}",
-            parse_mode="HTML",
-        )
-    else:
-        await update.message.reply_text(
-            f"Дата {format_when(dt)} уже прошла — напоминание не поставил."
-        )
+def _parse_dt(s: str) -> datetime:
+    """Разбирает 'YYYY-MM-DD HH:MM' от Gemini в datetime (без таймзоны — местное время)."""
+    s = s.strip()
+    try:
+        return datetime.strptime(s, "%Y-%m-%d %H:%M")
+    except ValueError:
+        return datetime.fromisoformat(s)  # на случай секунд/другого ISO
 
 
-# ───────────────────────── Удаление по голосу/тексту ──────────────────────────
+def _parse_bday(s: str):
+    """Разбирает 'MM-DD' от Gemini в (month, day)."""
+    month, day = s.strip().split("-")
+    return int(month), int(day)
 
-# Намерение удалить: фраза начинается с такого слова.
-DELETE_RE = re.compile(
-    r"^\s*(удали(ть)?|удоли(ть)?|убери|убрать|сотри|стереть|отмени(ть)?|снеси|удол\w*)\b",
-    re.IGNORECASE,
-)
 
-# Слова, которые в запросе на удаление не относятся к названию задачи.
-DELETE_STOP_WORDS = {
+# ───────────────────────── Поиск задачи по описанию (для delete/reschedule) ──────────
+
+# Слова, которые в описании «что удалить/перенести» не относятся к названию задачи.
+MATCH_STOP_WORDS = {
     "задачу", "задача", "задание", "напоминание", "напоминалку", "напоминалка",
-    "дело", "из", "списка", "список", "пожалуйста", "плиз", "это", "эту", "этот",
-    "мне", "мой", "мою", "про", "напоминалки",
+    "дело", "из", "списка", "список", "это", "эту", "этот", "напоминалки",
 }
 
 
-def is_delete_intent(text: str) -> bool:
-    return bool(DELETE_RE.match(text))
-
-
 def find_matches(query: str):
-    """Ищет активные напоминания (задачи и ДР), чьё название похоже на запрос."""
+    """Ищет активные напоминания, чьё название похоже на описание из действия."""
     qtokens = [
         w for w in re.findall(r"[а-яёa-z0-9]+", query.lower())
-        if w not in DELETE_STOP_WORDS and w not in DATE_WORDS and len(w) >= 3
+        if w not in MATCH_STOP_WORDS and len(w) >= 3
     ]
     if not qtokens:
         return []
@@ -375,98 +116,126 @@ def _match_label(r) -> str:
     return f"{dt:%d.%m %H:%M} {r['text']}"
 
 
-async def handle_delete_request(update: Update, context, raw_text: str):
-    """Удаление по фразе: 'удали зал'. Одно совпадение — удаляем, несколько — кнопки выбора."""
-    query = DELETE_RE.sub("", raw_text, count=1).strip(" ,.:-—")
+# ───────────────────────── Выполнение действий от Gemini ──────────────────────────
+
+def _do_task(context, action: dict) -> str:
+    """Добавляет разовую задачу. Возвращает строку отчёта."""
+    text = (action.get("text") or "").strip()
+    dt_str = action.get("datetime")
+    if not text or not dt_str:
+        return "⚠️ Пропустил задачу — не понял текст или время."
+    try:
+        dt = _parse_dt(dt_str)
+    except (ValueError, TypeError):
+        return f"⚠️ Пропустил «{text}» — не понял время."
+
+    remind_at = dt.strftime("%Y-%m-%d %H:%M")
+    rid = add_reminder(text, remind_at, "none")
+    scheduled = schedule_reminder(context.bot, MY_CHAT_ID, rid, text, remind_at, "none")
+
+    line = f"✅ Добавил: {pick_emoji(text)} {text} — {format_when(dt)}"
+    if not scheduled:
+        line += " <i>(время уже прошло — напоминания не будет)</i>"
+    return line
+
+
+def _do_birthday(context, action: dict) -> str:
+    """Запоминает день рождения (ежегодно). Возвращает строку отчёта."""
+    name = (action.get("name") or action.get("text") or "").strip()
+    date_str = action.get("date")
+    if not name or not date_str:
+        return "⚠️ Пропустил день рождения — не понял имя или дату."
+    try:
+        month, day = _parse_bday(date_str)
+        d = date(2024, month, day)  # 2024 — високосный, чтобы 29 февраля жило
+    except (ValueError, TypeError):
+        return f"⚠️ Пропустил ДР «{name}» — не понял дату."
+
+    remind_at = f"2024-{month:02d}-{day:02d} 09:00"
+    rid = add_reminder(name, remind_at, "yearly")
+    schedule_reminder(context.bot, MY_CHAT_ID, rid, name, remind_at, "yearly")
+    return f"✅ Запомнил ДР: 🎂 {name} — {ru_day_month(d)} <i>(напомню за 2 дня и утром)</i>"
+
+
+def _do_delete(action: dict, pending_buttons: list) -> str:
+    """Удаляет задачу по описанию. Несколько похожих → кладёт кнопки в pending_buttons."""
+    query = (action.get("text") or "").strip()
     matches = find_matches(query)
-
     if not matches:
-        hint = f" по «{query}»" if query else ""
-        await update.message.reply_text(
-            f"Не нашёл, что удалить{hint}. Посмотри /today или /week и удали кнопкой 🗑."
-        )
-        return
-
-    if len(matches) == 1:  # однозначно — удаляем сразу
+        return f"🤷 Не нашёл, что удалить: «{query}»"
+    if len(matches) == 1:
         r = matches[0]
         delete_reminder(r["id"])
         unschedule_reminder(r["id"])
-        await update.message.reply_text(f"🗑 Удалил: {r['text']}")
-        return
-
-    # несколько похожих — даём выбрать кнопкой
+        return f"🗑 Удалил: {r['text']}"
     items = [("list", r["id"], _match_label(r)) for r in matches]
-    await update.message.reply_text(
-        "Нашёл несколько — что удалить?",
-        reply_markup=_delete_keyboard(items),
-    )
+    pending_buttons.append((f"❓ Несколько похожих на «{query}» — что удалить?", items))
+    return None  # отчёт не нужен, будут кнопки
+
+
+def _do_reschedule(context, action: dict) -> str:
+    """Переносит существующую задачу на новое время. Возвращает строку отчёта."""
+    query = (action.get("text") or "").strip()
+    dt_str = action.get("datetime")
+    if not dt_str:
+        return f"⚠️ Не понял, на когда переносить «{query}»."
+    try:
+        dt = _parse_dt(dt_str)
+    except (ValueError, TypeError):
+        return f"⚠️ Не понял новое время для «{query}»."
+
+    matches = find_matches(query)
+    if not matches:
+        return f"🤷 Не нашёл задачу для переноса: «{query}»"
+    if len(matches) > 1:
+        return f"❓ Несколько задач похожи на «{query}» — уточни, какую перенести."
+
+    r = matches[0]
+    remind_at = dt.strftime("%Y-%m-%d %H:%M")
+    update_reminder_time(r["id"], remind_at)
+    unschedule_reminder(r["id"])
+    schedule_reminder(context.bot, MY_CHAT_ID, r["id"], r["text"], remind_at, r["recurrence"])
+    return f"🔄 Перенёс: {pick_emoji(r['text'])} {r['text']} → {format_when(dt)}"
 
 
 async def process_free_text(update: Update, context, raw_text: str):
     """
-    Общая логика для текстовых и голосовых сообщений.
-    Понимает дату, время, дни рождения и удаление; если дата есть, а времени нет — переспрашивает.
+    Единый обработчик текста и голоса: отдаёт фразу Gemini, получает список
+    действий (task/birthday/delete/reschedule) и выполняет их, затем шлёт отчёт.
     """
-    # 0) Просьба удалить — обрабатываем отдельно (и текстом, и голосом).
-    if is_delete_intent(raw_text):
-        await handle_delete_request(update, context, raw_text)
+    # Разбор — блокирующий сетевой вызов, уносим в поток, чтобы не подвешивать бота.
+    try:
+        actions = await asyncio.to_thread(brain.parse_message, raw_text)
+    except Exception:
+        await update.message.reply_text("⚠️ Не понял, переформулируй")
         return
 
-    # 1) Если раньше переспросили «во сколько?» — пробуем понять ответ как время.
-    pending = context.user_data.get("pending")
-    if pending:
-        tf = extract_time(raw_text)
-        leftover = clean_task_text(_blank(raw_text, tf[2])) if tf else clean_task_text(raw_text)
-        if tf and not leftover:  # это действительно просто время — достраиваем задачу
-            context.user_data.pop("pending")
-            d = date.fromisoformat(pending["date"])
-            await _create_reminder(update, context, pending["task"], d, (tf[0], tf[1]), "none")
-            return
-        context.user_data.pop("pending")  # иначе это новая фраза — забываем и разбираем заново
-
-    parsed = parse_when(raw_text)
-    recurrence, the_date, the_time, task = (
-        parsed["recurrence"], parsed["date"], parsed["time"], parsed["task"],
-    )
-
-    # 2) День рождения — нужна дата (день и месяц), время по умолчанию 09:00.
-    if recurrence == "yearly":
-        if the_date is None:
-            await update.message.reply_text(
-                "🎂 Не понял дату дня рождения. Например:\n<i>ДР мамы 20 августа</i>",
-                parse_mode="HTML",
-            )
-            return
-        await _create_reminder(update, context, task, the_date, the_time or (9, 0), "yearly")
+    if not actions:
+        await update.message.reply_text("⚠️ Не понял, переформулируй")
         return
 
-    # 3) Обычная задача
-    if the_date is None and the_time is None:
-        await update.message.reply_text(
-            "⏰ Не понял когда. Например:\n"
-            "<i>завтра в 15:00 встреча</i>  или  <i>15.06 в 10:00 оплатить аренду</i>",
-            parse_mode="HTML",
-        )
-        return
+    report = []                 # строки отчёта о выполненном
+    pending_buttons = []        # (текст, items) для неоднозначных удалений
 
-    if the_time is None:  # дата есть, времени нет → переспрашиваем
-        context.user_data["pending"] = {"date": the_date.isoformat(), "task": task}
-        await update.message.reply_text(
-            f"🕐 Во сколько напомнить <b>{format_date(the_date)}</b>? "
-            f"Напиши время, например <i>11:00</i>",
-            parse_mode="HTML",
-        )
-        return
+    for action in actions:
+        kind = action.get("type")
+        if kind == "task":
+            report.append(_do_task(context, action))
+        elif kind == "birthday":
+            report.append(_do_birthday(context, action))
+        elif kind == "delete":
+            line = _do_delete(action, pending_buttons)
+            if line:
+                report.append(line)
+        elif kind == "reschedule":
+            report.append(_do_reschedule(context, action))
 
-    # Время есть. Нет даты → сегодня; если сегодня уже прошло — переносим на завтра.
-    rolled = False
-    d = the_date or datetime.now(TZ).date()
-    if the_date is None:
-        candidate = datetime(d.year, d.month, d.day, the_time[0], the_time[1])
-        if candidate <= datetime.now(TZ).replace(tzinfo=None):
-            d = d + timedelta(days=1)
-            rolled = True
-    await _create_reminder(update, context, task, d, the_time, "none", rolled=rolled)
+    if report:
+        await update.message.reply_text("\n".join(report), parse_mode="HTML")
+
+    # Неоднозначные удаления — отдельными сообщениями с кнопками выбора.
+    for prompt, items in pending_buttons:
+        await update.message.reply_text(prompt, reply_markup=_delete_keyboard(items))
 
 
 # ───────────────────────── Обработчики команд ──────────────────────────
@@ -477,13 +246,14 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(
         "Привет! Я твой личный планер. ⏱ Время — по Бали (UTC+8).\n\n"
-        "Просто напиши или скажи 🎤 задачу — я сам пойму когда:\n"
+        "Просто напиши или скажи 🎤 что угодно — я сам пойму:\n"
         "<i>завтра в 15:00 встреча с клиентом</i>\n"
         "<i>позвонить маме через 2 часа</i>\n"
         "<i>15.06 в 10:00 оплатить аренду</i>\n"
-        "<i>ДР мамы 20 августа</i>\n\n"
-        "Если скажешь только дату — переспрошу время.\n"
-        "Удалить: скажи «<i>удали зал</i>» или нажми 🗑 под задачей.\n\n"
+        "<i>ДР мамы 20 августа</i>\n"
+        "<i>перенеси зал на 18:00</i>\n"
+        "<i>удали созвон</i>\n\n"
+        "Можно несколько дел в одной фразе — разберу все сразу.\n\n"
         "Команды:\n"
         "/today — задачи на сегодня\n"
         "/week — задачи на 7 дней вперёд\n"
@@ -559,11 +329,6 @@ def days_word(n: int) -> str:
     return "дней"
 
 
-def task_line(dt: datetime, text: str) -> str:
-    """Строка задачи в стиле v1.1: моноширинное время + эмодзи + текст."""
-    return f"<code>{dt:%H:%M}</code> {pick_emoji(text)} {text}"
-
-
 def _short(s: str, n: int = 25) -> str:
     """Обрезает подпись кнопки, чтобы не была слишком длинной."""
     return s if len(s) <= n else s[: n - 1] + "…"
@@ -603,13 +368,14 @@ def render_today():
         return "✨ На сегодня пусто", None
 
     rows.sort(key=lambda r: r["remind_at"])  # ISO-строки сортируются по времени корректно
-    lines = ["📋 <b>Задачи на сегодня:</b>\n"]
-    items = []
-    for r in rows:
+    blocks, items = [], []
+    for i, r in enumerate(rows, 1):
         dt = datetime.fromisoformat(r["remind_at"])
-        lines.append(task_line(dt, r["text"]))
+        # Блок задачи: «1. 🏋 Тренировка» + время на отдельной строке.
+        blocks.append(f"{i}. {pick_emoji(r['text'])} {r['text']}\n   🕐 <code>{dt:%H:%M}</code>")
         items.append(("today", r["id"], f"{dt:%H:%M} {r['text']}"))
-    return "\n".join(lines), _delete_keyboard(items)
+    body = "\n\n".join(blocks)
+    return f"📋 <b>Задачи на сегодня:</b>\n\n{body}", _delete_keyboard(items)
 
 
 def render_week():
@@ -624,20 +390,24 @@ def render_week():
         return "✨ На ближайшую неделю задач нет", None
 
     rows.sort(key=lambda r: r["remind_at"])
-    lines = []
-    items = []
-    current_day = None
+    parts, items = [], []
+    current_day, day_lines = None, []
     for r in rows:
         dt = datetime.fromisoformat(r["remind_at"])
         d = dt.date()
-        if d != current_day:               # новый день → заголовок с датой
-            if lines:
-                lines.append("")           # пустая строка между днями
-            lines.append(f"📅 <b>{ru_date_header(d)}</b>")
+        if d != current_day:                       # начался новый день → новый блок
+            if day_lines:
+                parts.append("\n".join(day_lines))
+            day_lines = [f"📅 <b>{ru_date_header(d)}</b>"]
             current_day = d
-        lines.append(task_line(dt, r["text"]))
+        day_lines.append(f"{pick_emoji(r['text'])} {r['text']}")
+        day_lines.append(f"   🕐 <code>{dt:%H:%M}</code>")
         items.append(("week", r["id"], f"{dt:%d.%m %H:%M} {r['text']}"))
-    return "\n".join(lines), _delete_keyboard(items)
+    if day_lines:
+        parts.append("\n".join(day_lines))
+
+    body = "\n\n".join(parts)  # пустая строка между днями
+    return f"🗓 <b>Задачи на неделю:</b>\n\n{body}", _delete_keyboard(items)
 
 
 def render_list():
@@ -645,13 +415,14 @@ def render_list():
     if not reminders:
         return "✨ Задач нет. Просто напиши, что и когда напомнить.", None
 
-    lines = ["📋 <b>Твои задачи:</b>\n"]
-    items = []
-    for r in reminders:
+    reminders.sort(key=lambda r: r["remind_at"])
+    blocks, items = [], []
+    for i, r in enumerate(reminders, 1):
         dt = datetime.fromisoformat(r["remind_at"])
-        lines.append(f"{pick_emoji(r['text'])} {r['text']} <code>{format_when(dt)}</code>")
+        blocks.append(f"{i}. {pick_emoji(r['text'])} {r['text']}\n   📅 <code>{format_when(dt)}</code>")
         items.append(("list", r["id"], f"{dt:%d.%m %H:%M} {r['text']}"))
-    return "\n".join(lines), _delete_keyboard(items)
+    body = "\n\n".join(blocks)
+    return f"📋 <b>Все задачи:</b>\n\n{body}", _delete_keyboard(items)
 
 
 def render_birthdays():
@@ -662,22 +433,22 @@ def render_birthdays():
     today = datetime.now(TZ).date()
     bdays.sort(key=lambda r: _next_birthday(r, today))  # ближайший — сверху
 
-    lines = ["🎂 <b>Дни рождения:</b>\n"]
-    items = []
-    for i, r in enumerate(bdays):
+    blocks, items = [], []
+    for i, r in enumerate(bdays, 1):
         d = datetime.fromisoformat(r["remind_at"]).date()
         suffix = ""
-        if i == 0:  # «через N дней» считаем только до ближайшего
+        if i == 1:  # «через N дней» считаем только до ближайшего
             days = (_next_birthday(r, today) - today).days
             if days == 0:
-                suffix = " (сегодня! 🎉)"
+                suffix = " — сегодня! 🎉"
             elif days == 1:
-                suffix = " (завтра)"
+                suffix = " — завтра"
             else:
-                suffix = f" (через {days} {days_word(days)})"
-        lines.append(f"<code>{ru_day_month(d)}</code> — {r['text']}{suffix}")
+                suffix = f" — через {days} {days_word(days)}"
+        blocks.append(f"{i}. 🎂 {r['text']}\n   📅 <code>{ru_day_month(d)}</code>{suffix}")
         items.append(("bday", r["id"], f"{ru_day_month(d)} {r['text']}"))
-    return "\n".join(lines), _delete_keyboard(items)
+    body = "\n\n".join(blocks)
+    return f"🎂 <b>Дни рождения:</b>\n\n{body}", _delete_keyboard(items)
 
 
 # Сопоставление имени вида с его рендером — нужно при перерисовке после удаления.
@@ -763,7 +534,7 @@ async def cmd_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ───────────────────────── Свободный текст и голос ──────────────────────────
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Принимает обычный текст (не команду) и обрабатывает как задачу."""
+    """Принимает обычный текст (не команду) и обрабатывает через Gemini."""
     if not is_owner(update):
         return
     await process_free_text(update, context, update.message.text)
@@ -772,7 +543,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Принимает голосовое сообщение:
-    скачивает .ogg → распознаёт через stt.transcribe (Groq/Whisper) → обрабатывает как текст.
+    скачивает .ogg → распознаёт через stt.transcribe (Groq/Whisper) → отдаёт в Gemini.
     """
     if not is_owner(update):
         return
