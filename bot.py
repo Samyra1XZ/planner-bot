@@ -46,6 +46,29 @@ def is_allowed(update: Update) -> bool:
     return _allowed(update.effective_user.id)
 
 
+# Кому уже отправляли владельцу запрос доступа (чтобы не спамить; сброс при рестарте).
+_access_requested = set()
+
+
+async def _notify_access_request(context, update: Update):
+    """Сообщает владельцу, что новый человек просит доступ (один раз на пользователя)."""
+    user = update.effective_user
+    uid = user.id
+    if uid == MY_CHAT_ID or uid in _access_requested:
+        return
+    _access_requested.add(uid)
+    name = user.full_name or (f"@{user.username}" if user.username else str(uid))
+    try:
+        await context.bot.send_message(
+            MY_CHAT_ID,
+            f"🔔 Запрос доступа: <b>{name}</b> (id <code>{uid}</code>)\n"
+            f"Выдать: <code>/allow {uid}</code>",
+            parse_mode="HTML",
+        )
+    except Exception:
+        pass
+
+
 def _tz(user_id: int) -> ZoneInfo:
     """Личная таймзона пользователя как ZoneInfo (дефолт — TZ при ошибке)."""
     try:
@@ -109,7 +132,9 @@ def _help_text() -> str:
         "<i>купить продукты, позвонить в банк</i> (без времени → чек-лист)\n"
         "<i>каждый будний день в 9 планёрка</i> (повтор)\n"
         "<i>ДР мамы 20 августа</i>\n"
-        "<i>перенеси зал на 18:00</i> · <i>удали созвон</i>\n\n"
+        "<i>напомни про созвон каждые 15 минут 3 раза</i>\n"
+        "<i>перенеси зал на 18:00</i> · <i>удали созвон</i>\n"
+        "А ещё можно спрашивать: <i>что у меня завтра?</i>, <i>когда я к врачу?</i>\n\n"
         "Команды:\n"
         "/today · /week · /upcoming · /birthdays — списки\n"
         "/digest 08:00 — утренний дайджест (или /digest off)\n"
@@ -502,12 +527,36 @@ def _do_interval(context, action: dict, user_id: int, tz: ZoneInfo) -> str:
     return f"🔔 Напомню про {pick_emoji(text)} {text} {times}× каждые {_minutes_label(every)}: {shown}"
 
 
+async def _handle_query(update: Update, context, action: dict, user_id: int, tz: ZoneInfo):
+    """Ответ на вопрос о планах («что у меня завтра?», «когда я к врачу?»)."""
+    scope = (action.get("scope") or "today").lower()
+    reply = update.message.reply_text
+
+    if scope == "week":
+        text, markup = render_week(user_id, tz)
+        await reply(text, parse_mode="HTML", reply_markup=markup)
+    elif scope == "upcoming":
+        text, markup = render_upcoming(user_id, tz)
+        await reply(text, parse_mode="HTML", reply_markup=markup)
+    elif scope == "birthdays":
+        text, markup = render_birthdays(user_id, tz)
+        await reply(text, parse_mode="HTML", reply_markup=markup)
+    elif scope == "tomorrow":
+        d = datetime.now(tz).date() + timedelta(days=1)
+        await reply(render_day_readonly(user_id, tz, d, "Завтра"), parse_mode="HTML")
+    elif scope == "search":
+        await reply(render_search(user_id, tz, action.get("text") or ""), parse_mode="HTML")
+    else:  # today по умолчанию
+        text, markup = render_today(user_id, tz)
+        await reply(text, parse_mode="HTML", reply_markup=markup)
+
+
 async def process_free_text(update: Update, context, raw_text: str):
     """
     Единый обработчик текста и голоса: отдаёт фразу Gemini (в таймзоне юзера),
-    получает список действий. Сложные/рисковые (несколько действий или
-    удаление/перенос) сначала показываем на подтверждение; одиночное добавление —
-    сразу.
+    получает список действий. Вопросы о планах отвечаем сразу; сложные/рисковые
+    действия (несколько / удаление / перенос / серия) — через подтверждение;
+    одиночное добавление — сразу.
     """
     user_id = update.effective_user.id
     tz = _tz(user_id)
@@ -527,8 +576,18 @@ async def process_free_text(update: Update, context, raw_text: str):
             await update.message.reply_text("⚠️ Не понял, переформулируй")
         return
 
-    if not actions:
+    # Вопросы о планах обрабатываем отдельно (read-only, без подтверждения).
+    queries = [a for a in actions if a.get("type") == "query"]
+    actions = [a for a in actions if a.get("type") != "query"]
+
+    if not actions and not queries:
         await update.message.reply_text("⚠️ Не понял, переформулируй")
+        return
+
+    for q in queries:
+        await _handle_query(update, context, q, user_id, tz)
+
+    if not actions:
         return
 
     # Подтверждение нужно, если действий несколько ИЛИ есть удаление/перенос/серия.
@@ -558,13 +617,14 @@ async def process_free_text(update: Update, context, raw_text: str):
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
 
-    # Нет доступа — подсказываем ID, чтобы владелец мог добавить.
+    # Нет доступа — подсказываем ID и уведомляем владельца.
     if not is_allowed(update):
         await update.message.reply_text(
             f"🚫 Доступа пока нет. Твой ID: <code>{uid}</code>\n"
             "Перешли его владельцу бота — он добавит тебя.",
             parse_mode="HTML",
         )
+        await _notify_access_request(context, update)
         return
 
     ensure_user(uid)
@@ -926,6 +986,59 @@ def render_upcoming(user_id: int, tz: ZoneInfo):
     return f"📆 <b>Впереди:</b>\n\n{body}", _item_keyboard(items)
 
 
+def render_day_readonly(user_id: int, tz: ZoneInfo, d: date, title: str) -> str:
+    """Снимок задач на конкретный день (для ответов на вопросы) — без кнопок."""
+    rows = get_active_reminders(user_id)
+    timed, flex = [], []
+    for r in rows:
+        if r["flexible"]:
+            if datetime.fromisoformat(r["remind_at"]).date() == d:
+                flex.append(r)
+        elif r["recurrence"] == "none":
+            if datetime.fromisoformat(r["remind_at"]).date() == d:
+                timed.append((datetime.fromisoformat(r["remind_at"]), r, False))
+        elif r["recurrence"] in RECURRING and _recurs_on(r, d):
+            timed.append((datetime.fromisoformat(r["remind_at"]), r, True))
+
+    if not timed and not flex:
+        return f"<b>{title}</b>\n\n✨ Пусто"
+
+    parts = []
+    if timed:
+        timed.sort(key=lambda x: x[0].time())
+        block = ["⏰ <b>По времени:</b>"]
+        for dt, r, is_rec in timed:
+            mark = "🔁" if is_rec else "🕐"
+            block.append(f"{mark} <code>{dt:%H:%M}</code> {pick_emoji(r['text'])} {r['text']}")
+        parts.append("\n".join(block))
+    if flex:
+        flex.sort(key=lambda r: r["ord"])
+        block = ["📝 <b>Без времени:</b>"]
+        for i, r in enumerate(flex, 1):
+            block.append(f"{i}. {pick_emoji(r['text'])} {r['text']}")
+        parts.append("\n".join(block))
+    return f"<b>{title}</b>\n\n" + "\n\n".join(parts)
+
+
+def render_search(user_id: int, tz: ZoneInfo, query: str) -> str:
+    """Поиск конкретного дела по описанию (ответ на «когда я к врачу?»)."""
+    matches = find_matches(query, user_id)
+    if not matches:
+        return f"🔍 По «{query}» ничего не нашёл."
+    lines = [f"🔍 <b>Нашёл по «{query}»:</b>"]
+    for r in matches:
+        dt = datetime.fromisoformat(r["remind_at"])
+        if r["recurrence"] == "yearly":
+            lines.append(f"🎂 {ru_day_month(dt.date())} — {r['text']}")
+        elif r["recurrence"] in RECURRING:
+            lines.append(f"🔁 {_repeat_label(r['recurrence'], dt)} в {dt:%H:%M} — {r['text']}")
+        elif r["flexible"]:
+            lines.append(f"📝 {_day_label(dt.date(), tz)} (без времени) — {r['text']}")
+        else:
+            lines.append(f"🕐 {format_when(dt, tz)} — {r['text']}")
+    return "\n".join(lines)
+
+
 # Сопоставление имени вида с его рендером — нужно при перерисовке после удаления.
 RENDERERS = {
     "today": render_today, "week": render_week,
@@ -1234,6 +1347,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"🚫 Доступа пока нет. Твой ID: <code>{uid}</code> — перешли его владельцу.",
             parse_mode="HTML",
         )
+        await _notify_access_request(context, update)
         return
 
     text = update.message.text
