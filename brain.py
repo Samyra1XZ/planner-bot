@@ -101,6 +101,11 @@ def _build_system_prompt(now: datetime) -> str:
    — удалить задачу. text — краткое описание, что удалить.
 4. {{"type": "reschedule", "text": "...", "datetime": "YYYY-MM-DD HH:MM"}}
    — перенести существующую задачу на новое время.
+5. {{"type": "interval", "text": "...", "every_minutes": 15, "times": 3}}
+   — напоминать о деле несколько раз через равные промежутки.
+   every_minutes — интервал В МИНУТАХ (час = 60), times — сколько раз.
+   Используй, когда просят «напомни про X через каждые N минут/часов M раз»
+   или «напомни M раз каждые N минут». Часы переводи в минуты.
 
 ПРАВИЛА:
 - В поле text — ТОЛЬКО чистая суть, с заглавной буквы. Вырезай мусорные слова:
@@ -122,7 +127,7 @@ def _build_system_prompt(now: datetime) -> str:
 
 
 # Разрешённые типы действий — всё лишнее от модели отфильтруем.
-_VALID_TYPES = {"task", "birthday", "delete", "reschedule"}
+_VALID_TYPES = {"task", "birthday", "delete", "reschedule", "interval"}
 
 
 def _strip_fences(raw: str) -> str:

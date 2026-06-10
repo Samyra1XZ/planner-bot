@@ -388,6 +388,8 @@ def _execute_actions(context, actions: list, user_id: int, tz: ZoneInfo):
                 report.append(line)
         elif kind == "reschedule":
             report.append(_do_reschedule(context, action, user_id, tz))
+        elif kind == "interval":
+            report.append(_do_interval(context, action, user_id, tz))
     return report, pending_buttons
 
 
@@ -444,6 +446,14 @@ def _preview_actions(actions: list, user_id: int, tz: ZoneInfo) -> str:
                 lines.append(f"🔄 перенести: {matches[0]['text']} → {when}")
             else:
                 lines.append(f"🔄 перенести «{q}» — несколько похожих")
+        elif kind == "interval":
+            text = (a.get("text") or "").strip()
+            try:
+                every = int(a.get("every_minutes"))
+                times = int(a.get("times"))
+                lines.append(f"🔔 {pick_emoji(text)} {text} — {times}× каждые {_minutes_label(every)}")
+            except (TypeError, ValueError):
+                lines.append(f"⚠️ напоминание «{text}» — не понял интервал/количество")
 
     body = "\n".join(f"• {line}" for line in lines)
     return f"🤔 Понял так — всё верно?\n\n{body}"
@@ -457,6 +467,39 @@ async def _send_results(send, report, pending_buttons):
         await send("\n".join(report), parse_mode="HTML", reply_markup=build_menu())
     for prompt, items in pending_buttons:
         await send(prompt, reply_markup=_item_keyboard(items, with_done=False))
+
+
+def _minutes_label(m: int) -> str:
+    """Интервал словами: '15 мин' / '2 ч'."""
+    return f"{m // 60} ч" if m % 60 == 0 and m >= 60 else f"{m} мин"
+
+
+MAX_INTERVAL_TIMES = 24  # потолок повторов, чтобы не засорять/не злоупотреблять
+
+
+def _do_interval(context, action: dict, user_id: int, tz: ZoneInfo) -> str:
+    """Несколько напоминаний о деле через равные промежутки (every_minutes × times)."""
+    text = (action.get("text") or "").strip()
+    try:
+        every = int(action.get("every_minutes"))
+        times = int(action.get("times"))
+    except (TypeError, ValueError):
+        return "⚠️ Пропустил напоминание — не понял интервал или количество."
+    if not text or every <= 0 or times <= 0:
+        return "⚠️ Пропустил напоминание — не понял интервал или количество."
+
+    times = min(times, MAX_INTERVAL_TIMES)
+    now = datetime.now(tz)
+    slots = []
+    for k in range(1, times + 1):
+        dt = now + timedelta(minutes=every * k)
+        remind_at = dt.strftime("%Y-%m-%d %H:%M")
+        rid = add_reminder(user_id, text, remind_at, "none")
+        schedule_reminder(context.bot, user_id, rid, text, remind_at, "none", tz=tz, extras=False)
+        slots.append(dt)
+
+    shown = ", ".join(f"{dt:%H:%M}" for dt in slots[:6]) + ("…" if len(slots) > 6 else "")
+    return f"🔔 Напомню про {pick_emoji(text)} {text} {times}× каждые {_minutes_label(every)}: {shown}"
 
 
 async def process_free_text(update: Update, context, raw_text: str):
@@ -488,9 +531,9 @@ async def process_free_text(update: Update, context, raw_text: str):
         await update.message.reply_text("⚠️ Не понял, переформулируй")
         return
 
-    # Подтверждение нужно, если действий несколько ИЛИ есть удаление/перенос.
+    # Подтверждение нужно, если действий несколько ИЛИ есть удаление/перенос/серия.
     needs_confirm = len(actions) > 1 or any(
-        a.get("type") in ("delete", "reschedule") for a in actions
+        a.get("type") in ("delete", "reschedule", "interval") for a in actions
     )
 
     if needs_confirm:

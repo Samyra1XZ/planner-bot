@@ -101,12 +101,14 @@ def _schedule_recurring(bot, chat_id: int, reminder_id: int, text: str,
 
 
 def schedule_reminder(bot, chat_id: int, reminder_id: int, text: str,
-                      remind_at: str, recurrence: str = "none", tz=None) -> bool:
+                      remind_at: str, recurrence: str = "none", tz=None,
+                      extras: bool = True) -> bool:
     """
     Ставит напоминание в ЛИЧНОЙ таймзоне пользователя (tz — строка IANA или ZoneInfo).
     remind_at — ISO 'YYYY-MM-DD HH:MM' в местном времени пользователя.
     recurrence='yearly' → ежегодный ДР; 'daily'/'weekdays'/'weekly' → повтор;
-    иначе разовое на дату. Возвращает True если поставлено, False если время прошло.
+    иначе разовое на дату. extras=False — без «за 10 минут» и заблаговременных пингов
+    (для частых интервальных напоминаний). Возвращает True если поставлено.
     """
     tz = _as_tz(tz)
     # Строку из БД считаем местным временем пользователя — явно вешаем его таймзону.
@@ -133,6 +135,9 @@ def schedule_reminder(bot, chat_id: int, reminder_id: int, text: str,
         id=str(reminder_id),
         replace_existing=True,
     )
+
+    if not extras:
+        return True  # интервальные напоминания — без пред-/заблаговременных
 
     # Предварительное напоминание — за 10 минут, если ещё не прошло
     pre_date = dt - timedelta(minutes=10)
