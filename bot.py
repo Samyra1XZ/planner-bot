@@ -141,6 +141,37 @@ def _day_label(d: date, tz: ZoneInfo) -> str:
     return format_date(d, tz)
 
 
+# Повторы. Множественная форма для подписи «по понедельникам» и т.п.
+RECURRING = ("daily", "weekdays", "weekly")
+WEEKDAY_EVERY = [
+    "понедельникам", "вторникам", "средам", "четвергам",
+    "пятницам", "субботам", "воскресеньям",
+]
+
+
+def _repeat_label(recurrence: str, dt: datetime) -> str:
+    """Человеческая подпись повтора: 'каждый день' / 'по будням' / 'по понедельникам'."""
+    if recurrence == "daily":
+        return "каждый день"
+    if recurrence == "weekdays":
+        return "по будням"
+    if recurrence == "weekly":
+        return f"по {WEEKDAY_EVERY[dt.weekday()]}"
+    return ""
+
+
+def _recurs_on(r, d: date) -> bool:
+    """Выпадает ли повторяющаяся задача r на дату d."""
+    rec = r["recurrence"]
+    if rec == "daily":
+        return True
+    if rec == "weekdays":
+        return d.weekday() < 5
+    if rec == "weekly":
+        return datetime.fromisoformat(r["remind_at"]).weekday() == d.weekday()
+    return False
+
+
 # ───────────────────────── Поиск задачи по описанию (для delete/reschedule) ──────────
 
 # Слова, которые в описании «что удалить/перенести» не относятся к названию задачи.
@@ -189,6 +220,17 @@ def _do_task(context, action: dict, user_id: int, tz: ZoneInfo) -> str:
         day, hm = _parse_task_when(dt_str)
     except (ValueError, TypeError):
         return f"⚠️ Пропустил «{text}» — не понял дату/время."
+
+    # Повторяющаяся задача → cron-напоминание (повтор требует времени, нет → 09:00).
+    repeat = (action.get("repeat") or "").strip().lower()
+    if repeat in RECURRING:
+        if hm is None:
+            hm = (9, 0)
+        dt = datetime(day.year, day.month, day.day, hm[0], hm[1])
+        remind_at = dt.strftime("%Y-%m-%d %H:%M")
+        rid = add_reminder(user_id, text, remind_at, repeat)
+        schedule_reminder(context.bot, user_id, rid, text, remind_at, repeat, tz=tz)
+        return f"🔁 Добавил ({_repeat_label(repeat, dt)} в {dt:%H:%M}): {pick_emoji(text)} {text}"
 
     # Без времени → в чек-лист (по порядку), напоминание не ставим.
     if hm is None:
@@ -307,9 +349,14 @@ def _preview_actions(actions: list, user_id: int, tz: ZoneInfo) -> str:
         kind = a.get("type")
         if kind == "task":
             text = (a.get("text") or "").strip()
+            repeat = (a.get("repeat") or "").strip().lower()
             try:
                 day, hm = _parse_task_when(a.get("datetime"))
-                if hm is None:
+                if repeat in RECURRING:
+                    hh, mm = hm if hm else (9, 0)
+                    dt = datetime(day.year, day.month, day.day, hh, mm)
+                    lines.append(f"🔁 {pick_emoji(text)} {text} — {_repeat_label(repeat, dt)} в {dt:%H:%M}")
+                elif hm is None:
                     lines.append(f"📝 {pick_emoji(text)} {text} (без времени, {_day_label(day, tz)})")
                 else:
                     dt = datetime(day.year, day.month, day.day, hm[0], hm[1])
@@ -514,15 +561,17 @@ def _short(s: str, n: int = 25) -> str:
 
 def _item_keyboard(items, with_done: bool = True):
     """
-    items — список (view, id, подпись). На каждую задачу строка кнопок:
-    с галочкой «✅ выполнено» (основное действие) и 🗑 удалить.
-    with_done=False — только 🗑 (для дней рождения и выбора при удалении).
+    items — список (view, id, подпись) или (view, id, подпись, done_ok).
+    На каждую задачу строка: «✅ выполнено» + 🗑. done_ok=False (или with_done=False) —
+    только 🗑 (для ДР, повторяющихся задач и выбора при удалении).
     """
     if not items:
         return None
     rows = []
-    for view, rid, label in items:
-        if with_done:
+    for item in items:
+        view, rid, label = item[0], item[1], item[2]
+        done_ok = item[3] if len(item) > 3 else with_done
+        if done_ok:
             rows.append([
                 InlineKeyboardButton(f"✅ {_short(label)}", callback_data=f"done:{view}:{rid}"),
                 InlineKeyboardButton("🗑", callback_data=f"del:{view}:{rid}"),
@@ -550,21 +599,34 @@ def _next_birthday(r, today: date) -> date:
 def render_today(user_id: int, tz: ZoneInfo):
     today = datetime.now(tz).date()
     rows = get_active_reminders(user_id)
-    timed = [r for r in rows if not r["flexible"] and r["recurrence"] == "none"
-             and datetime.fromisoformat(r["remind_at"]).date() == today]
-    flex = [r for r in rows if r["flexible"]
-            and datetime.fromisoformat(r["remind_at"]).date() == today]
+
+    # Секция «по времени»: разовые на сегодня + повторы, выпадающие на сегодня.
+    timed = []  # (dt, r, is_recurring)
+    flex = []
+    for r in rows:
+        if r["flexible"]:
+            if datetime.fromisoformat(r["remind_at"]).date() == today:
+                flex.append(r)
+        elif r["recurrence"] == "none":
+            if datetime.fromisoformat(r["remind_at"]).date() == today:
+                timed.append((datetime.fromisoformat(r["remind_at"]), r, False))
+        elif r["recurrence"] in RECURRING and _recurs_on(r, today):
+            timed.append((datetime.fromisoformat(r["remind_at"]), r, True))
+
     if not timed and not flex:
         return "✨ На сегодня пусто", None
 
     parts, items = [], []
     if timed:
-        timed.sort(key=lambda r: r["remind_at"])
+        timed.sort(key=lambda x: x[0].time())
         block = ["⏰ <b>По времени:</b>"]
-        for r in timed:
-            dt = datetime.fromisoformat(r["remind_at"])
-            block.append(f"🕐 <code>{dt:%H:%M}</code> {pick_emoji(r['text'])} {r['text']}")
-            items.append(("today", r["id"], f"{dt:%H:%M} {r['text']}"))
+        for dt, r, is_rec in timed:
+            mark = "🔁" if is_rec else "🕐"
+            block.append(f"{mark} <code>{dt:%H:%M}</code> {pick_emoji(r['text'])} {r['text']}")
+            if is_rec:
+                items.append(("today", r["id"], r["text"], False))  # повтор — только 🗑
+            else:
+                items.append(("today", r["id"], f"{dt:%H:%M} {r['text']}"))
         parts.append("\n".join(block))
     if flex:
         flex.sort(key=lambda r: r["ord"])
@@ -580,34 +642,43 @@ def render_today(user_id: int, tz: ZoneInfo):
 
 def render_week(user_id: int, tz: ZoneInfo):
     today = datetime.now(tz).date()
-    end = today + timedelta(days=6)  # сегодня + 6 дней = 7 дней всего
-
-    # Группируем задачи по дню (и с временем, и без — кроме ежегодных ДР).
-    days = {}
-    for r in get_active_reminders(user_id):
-        if r["recurrence"] != "none" and not r["flexible"]:
-            continue  # ежегодные ДР тут не показываем
-        d = datetime.fromisoformat(r["remind_at"]).date()
-        if today <= d <= end:
-            days.setdefault(d, []).append(r)
-    if not days:
-        return "✨ На ближайшую неделю задач нет", None
+    rows = get_active_reminders(user_id)
 
     parts, items = [], []
-    for d in sorted(days):
-        group = days[d]
-        timed = sorted((r for r in group if not r["flexible"]), key=lambda r: r["remind_at"])
-        flex = sorted((r for r in group if r["flexible"]), key=lambda r: r["ord"])
+    for offset in range(7):                       # сегодня + 6 дней
+        d = today + timedelta(days=offset)
+        day_timed = []  # (dt, r, is_recurring)
+        day_flex = []
+        for r in rows:
+            if r["flexible"]:
+                if datetime.fromisoformat(r["remind_at"]).date() == d:
+                    day_flex.append(r)
+            elif r["recurrence"] == "none":
+                if datetime.fromisoformat(r["remind_at"]).date() == d:
+                    day_timed.append((datetime.fromisoformat(r["remind_at"]), r, False))
+            elif r["recurrence"] in RECURRING and _recurs_on(r, d):
+                day_timed.append((datetime.fromisoformat(r["remind_at"]), r, True))
+
+        if not day_timed and not day_flex:
+            continue
+
+        day_timed.sort(key=lambda x: x[0].time())
+        day_flex.sort(key=lambda r: r["ord"])
         lines = [f"📅 <b>{ru_date_header(d)}</b>"]
-        for r in timed:
-            dt = datetime.fromisoformat(r["remind_at"])
-            lines.append(f"🕐 <code>{dt:%H:%M}</code> {pick_emoji(r['text'])} {r['text']}")
-            items.append(("week", r["id"], f"{dt:%d.%m %H:%M} {r['text']}"))
-        for r in flex:
+        for dt, r, is_rec in day_timed:
+            mark = "🔁" if is_rec else "🕐"
+            lines.append(f"{mark} <code>{dt:%H:%M}</code> {pick_emoji(r['text'])} {r['text']}")
+            if is_rec:
+                items.append(("week", r["id"], r["text"], False))
+            else:
+                items.append(("week", r["id"], f"{dt:%d.%m %H:%M} {r['text']}"))
+        for r in day_flex:
             lines.append(f"📝 {pick_emoji(r['text'])} {r['text']}")
             items.append(("week", r["id"], f"{_day_label(d, tz)} {r['text']}"))
         parts.append("\n".join(lines))
 
+    if not parts:
+        return "✨ На ближайшую неделю задач нет", None
     body = "\n\n".join(parts)  # пустая строка между днями
     return f"🗓 <b>Задачи на неделю:</b>\n\n{body}", _item_keyboard(items)
 
@@ -615,8 +686,9 @@ def render_week(user_id: int, tz: ZoneInfo):
 def render_list(user_id: int, tz: ZoneInfo):
     rows = get_active_reminders(user_id)
     timed = [r for r in rows if not r["flexible"] and r["recurrence"] == "none"]
+    recurring = [r for r in rows if r["recurrence"] in RECURRING]
     flex = [r for r in rows if r["flexible"]]
-    if not timed and not flex:
+    if not timed and not recurring and not flex:
         return "✨ Задач нет. Просто напиши, что и когда напомнить.", None
 
     parts, items = [], []
@@ -627,6 +699,17 @@ def render_list(user_id: int, tz: ZoneInfo):
             dt = datetime.fromisoformat(r["remind_at"])
             block.append(f"🕐 <code>{format_when(dt, tz)}</code> {pick_emoji(r['text'])} {r['text']}")
             items.append(("list", r["id"], f"{dt:%d.%m %H:%M} {r['text']}"))
+        parts.append("\n".join(block))
+    if recurring:
+        recurring.sort(key=lambda r: datetime.fromisoformat(r["remind_at"]).time())
+        block = ["🔁 <b>Повторяющиеся:</b>"]
+        for i, r in enumerate(recurring, 1):
+            dt = datetime.fromisoformat(r["remind_at"])
+            block.append(
+                f"{i}. {pick_emoji(r['text'])} {r['text']}  "
+                f"<code>{_repeat_label(r['recurrence'], dt)}, {dt:%H:%M}</code>"
+            )
+            items.append(("list", r["id"], r["text"], False))  # повтор — только 🗑
         parts.append("\n".join(block))
     if flex:
         flex.sort(key=lambda r: (r["remind_at"], r["ord"]))

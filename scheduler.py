@@ -17,6 +17,10 @@ scheduler = AsyncIOScheduler(timezone=TZ)
 # Дни рождения: напоминаем за 2 дня (подумать о подарке) и в сам день, в 09:00.
 BIRTHDAY_HOUR = 9
 
+# Типы повторяющихся задач и соответствие дню недели для cron (Пн=0).
+RECURRING = ("daily", "weekdays", "weekly")
+_CRON_WEEKDAYS = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
+
 
 def _as_tz(tz):
     """Принимает строку IANA или ZoneInfo и возвращает ZoneInfo (дефолт — TZ)."""
@@ -73,13 +77,36 @@ def _schedule_yearly(bot, chat_id: int, reminder_id: int, text: str, dt: datetim
     return True
 
 
+def _schedule_recurring(bot, chat_id: int, reminder_id: int, text: str,
+                        dt: datetime, recurrence: str, tz) -> bool:
+    """
+    Ставит повторяющееся напоминание через cron в таймзоне tz:
+    daily — каждый день; weekdays — Пн-Пт; weekly — в день недели из dt.
+    """
+    kwargs = dict(hour=dt.hour, minute=dt.minute, timezone=tz)
+    if recurrence == "weekdays":
+        kwargs["day_of_week"] = "mon-fri"
+    elif recurrence == "weekly":
+        kwargs["day_of_week"] = _CRON_WEEKDAYS[dt.weekday()]
+    # daily — без day_of_week (каждый день)
+
+    scheduler.add_job(
+        _send_reminder,
+        trigger=CronTrigger(**kwargs),
+        args=[bot, chat_id, f"🔁 Сейчас: {text}"],
+        id=str(reminder_id),
+        replace_existing=True,
+    )
+    return True
+
+
 def schedule_reminder(bot, chat_id: int, reminder_id: int, text: str,
                       remind_at: str, recurrence: str = "none", tz=None) -> bool:
     """
     Ставит напоминание в ЛИЧНОЙ таймзоне пользователя (tz — строка IANA или ZoneInfo).
     remind_at — ISO 'YYYY-MM-DD HH:MM' в местном времени пользователя.
-    recurrence='yearly' → ежегодный день рождения; иначе разовое на дату.
-    Возвращает True если что-то поставлено, False если разовое время уже прошло.
+    recurrence='yearly' → ежегодный ДР; 'daily'/'weekdays'/'weekly' → повтор;
+    иначе разовое на дату. Возвращает True если поставлено, False если время прошло.
     """
     tz = _as_tz(tz)
     # Строку из БД считаем местным временем пользователя — явно вешаем его таймзону.
@@ -87,6 +114,9 @@ def schedule_reminder(bot, chat_id: int, reminder_id: int, text: str,
 
     if recurrence == "yearly":
         return _schedule_yearly(bot, chat_id, reminder_id, text, dt, tz)
+
+    if recurrence in RECURRING:
+        return _schedule_recurring(bot, chat_id, reminder_id, text, dt, recurrence, tz)
 
     now = datetime.now(tz)
     # Разовое время уже прошло — ставить нет смысла
