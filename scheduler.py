@@ -141,6 +141,9 @@ def reschedule_all(bot, reminders):
     каждое — в таймзоне его владельца. reminders — строки с полем user_id.
     """
     for reminder in reminders:
+        # Задачи без времени (чек-лист) не планируем — у них нет часа.
+        if reminder["flexible"]:
+            continue
         user_id = reminder["user_id"]
         schedule_reminder(
             bot,

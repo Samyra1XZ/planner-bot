@@ -17,7 +17,7 @@ from telegram.ext import (
 from database import (
     init_db, add_reminder, get_active_reminders, get_all_active_reminders, mark_done,
     delete_reminder, get_reminder_by_id, update_reminder_time, count_done_on,
-    ensure_user, get_user_timezone,
+    next_flexible_ord, ensure_user, get_user_timezone,
 )
 from scheduler import scheduler, schedule_reminder, reschedule_all, unschedule_reminder, TZ
 from stt import transcribe
@@ -116,6 +116,31 @@ def _parse_bday(s: str):
     return int(month), int(day)
 
 
+def _parse_task_when(s: str):
+    """
+    Разбирает datetime задачи от Gemini:
+      'YYYY-MM-DD HH:MM' → (date, (hour, minute))  — задача с временем;
+      'YYYY-MM-DD'       → (date, None)            — задача без времени (чек-лист).
+    """
+    s = s.strip()
+    try:
+        dt = datetime.strptime(s, "%Y-%m-%d %H:%M")
+        return dt.date(), (dt.hour, dt.minute)
+    except ValueError:
+        d = datetime.strptime(s, "%Y-%m-%d").date()  # только дата → без времени
+        return d, None
+
+
+def _day_label(d: date, tz: ZoneInfo) -> str:
+    """Короткая подпись дня без времени: 'сегодня' / 'завтра' / '15.06'."""
+    today = datetime.now(tz).date()
+    if d == today:
+        return "сегодня"
+    if d == today + timedelta(days=1):
+        return "завтра"
+    return format_date(d, tz)
+
+
 # ───────────────────────── Поиск задачи по описанию (для delete/reschedule) ──────────
 
 # Слова, которые в описании «что удалить/перенести» не относятся к названию задачи.
@@ -155,16 +180,25 @@ def _match_label(r) -> str:
 # ───────────────────────── Выполнение действий от Gemini ──────────────────────────
 
 def _do_task(context, action: dict, user_id: int, tz: ZoneInfo) -> str:
-    """Добавляет разовую задачу. Возвращает строку отчёта."""
+    """Добавляет задачу (с временем — с напоминанием; без времени — в чек-лист)."""
     text = (action.get("text") or "").strip()
     dt_str = action.get("datetime")
     if not text or not dt_str:
         return "⚠️ Пропустил задачу — не понял текст или время."
     try:
-        dt = _parse_dt(dt_str)
+        day, hm = _parse_task_when(dt_str)
     except (ValueError, TypeError):
-        return f"⚠️ Пропустил «{text}» — не понял время."
+        return f"⚠️ Пропустил «{text}» — не понял дату/время."
 
+    # Без времени → в чек-лист (по порядку), напоминание не ставим.
+    if hm is None:
+        day_iso = day.isoformat()
+        ordn = next_flexible_ord(user_id, day_iso)
+        add_reminder(user_id, text, day_iso, "none", flexible=1, ord=ordn)
+        return f"📝 В список ({_day_label(day, tz)}): {pick_emoji(text)} {text}"
+
+    # С временем → задача с напоминанием.
+    dt = datetime(day.year, day.month, day.day, hm[0], hm[1])
     remind_at = dt.strftime("%Y-%m-%d %H:%M")
     rid = add_reminder(user_id, text, remind_at, "none")
     scheduled = schedule_reminder(context.bot, user_id, rid, text, remind_at, "none", tz=tz)
@@ -274,10 +308,14 @@ def _preview_actions(actions: list, user_id: int, tz: ZoneInfo) -> str:
         if kind == "task":
             text = (a.get("text") or "").strip()
             try:
-                dt = _parse_dt(a.get("datetime"))
-                lines.append(f"➕ {pick_emoji(text)} {text} — {format_when(dt, tz)}")
+                day, hm = _parse_task_when(a.get("datetime"))
+                if hm is None:
+                    lines.append(f"📝 {pick_emoji(text)} {text} (без времени, {_day_label(day, tz)})")
+                else:
+                    dt = datetime(day.year, day.month, day.day, hm[0], hm[1])
+                    lines.append(f"➕ {pick_emoji(text)} {text} — {format_when(dt, tz)}")
             except (ValueError, TypeError):
-                lines.append(f"⚠️ задача «{text}» — не понял время")
+                lines.append(f"⚠️ задача «{text}» — не понял дату/время")
         elif kind == "birthday":
             name = (a.get("name") or a.get("text") or "").strip()
             try:
@@ -337,7 +375,14 @@ async def process_free_text(update: Update, context, raw_text: str):
         actions = await asyncio.to_thread(brain.parse_message, raw_text, tz)
     except Exception as e:
         print(f"[process_free_text] ошибка разбора: {e!r}")  # видно в логах Railway
-        await update.message.reply_text("⚠️ Не понял, переформулируй")
+        # Отличаем перегрузку/лимит ИИ от непонятной фразы — честное сообщение.
+        msg = str(e)
+        if any(k in msg for k in ("429", "RESOURCE_EXHAUSTED", "503", "UNAVAILABLE", "quota")):
+            await update.message.reply_text(
+                "⏳ ИИ сейчас занят или достигнут лимит. Попробуй ещё раз через минуту."
+            )
+        else:
+            await update.message.reply_text("⚠️ Не понял, переформулируй")
         return
 
     if not actions:
@@ -504,68 +549,95 @@ def _next_birthday(r, today: date) -> date:
 
 def render_today(user_id: int, tz: ZoneInfo):
     today = datetime.now(tz).date()
-    rows = [
-        r for r in get_active_reminders(user_id)
-        if r["recurrence"] == "none" and datetime.fromisoformat(r["remind_at"]).date() == today
-    ]
-    if not rows:
+    rows = get_active_reminders(user_id)
+    timed = [r for r in rows if not r["flexible"] and r["recurrence"] == "none"
+             and datetime.fromisoformat(r["remind_at"]).date() == today]
+    flex = [r for r in rows if r["flexible"]
+            and datetime.fromisoformat(r["remind_at"]).date() == today]
+    if not timed and not flex:
         return "✨ На сегодня пусто", None
 
-    rows.sort(key=lambda r: r["remind_at"])  # ISO-строки сортируются по времени корректно
-    blocks, items = [], []
-    for i, r in enumerate(rows, 1):
-        dt = datetime.fromisoformat(r["remind_at"])
-        # Блок задачи: «1. 🏋 Тренировка» + время на отдельной строке.
-        blocks.append(f"{i}. {pick_emoji(r['text'])} {r['text']}\n   🕐 <code>{dt:%H:%M}</code>")
-        items.append(("today", r["id"], f"{dt:%H:%M} {r['text']}"))
-    body = "\n\n".join(blocks)
+    parts, items = [], []
+    if timed:
+        timed.sort(key=lambda r: r["remind_at"])
+        block = ["⏰ <b>По времени:</b>"]
+        for r in timed:
+            dt = datetime.fromisoformat(r["remind_at"])
+            block.append(f"🕐 <code>{dt:%H:%M}</code> {pick_emoji(r['text'])} {r['text']}")
+            items.append(("today", r["id"], f"{dt:%H:%M} {r['text']}"))
+        parts.append("\n".join(block))
+    if flex:
+        flex.sort(key=lambda r: r["ord"])
+        block = ["📝 <b>Без времени:</b>"]
+        for i, r in enumerate(flex, 1):
+            block.append(f"{i}. {pick_emoji(r['text'])} {r['text']}")
+            items.append(("today", r["id"], r["text"]))
+        parts.append("\n".join(block))
+
+    body = "\n\n".join(parts)
     return f"📋 <b>Задачи на сегодня:</b>\n\n{body}", _item_keyboard(items)
 
 
 def render_week(user_id: int, tz: ZoneInfo):
     today = datetime.now(tz).date()
     end = today + timedelta(days=6)  # сегодня + 6 дней = 7 дней всего
-    rows = [
-        r for r in get_active_reminders(user_id)
-        if r["recurrence"] == "none"
-        and today <= datetime.fromisoformat(r["remind_at"]).date() <= end
-    ]
-    if not rows:
+
+    # Группируем задачи по дню (и с временем, и без — кроме ежегодных ДР).
+    days = {}
+    for r in get_active_reminders(user_id):
+        if r["recurrence"] != "none" and not r["flexible"]:
+            continue  # ежегодные ДР тут не показываем
+        d = datetime.fromisoformat(r["remind_at"]).date()
+        if today <= d <= end:
+            days.setdefault(d, []).append(r)
+    if not days:
         return "✨ На ближайшую неделю задач нет", None
 
-    rows.sort(key=lambda r: r["remind_at"])
     parts, items = [], []
-    current_day, day_lines = None, []
-    for r in rows:
-        dt = datetime.fromisoformat(r["remind_at"])
-        d = dt.date()
-        if d != current_day:                       # начался новый день → новый блок
-            if day_lines:
-                parts.append("\n".join(day_lines))
-            day_lines = [f"📅 <b>{ru_date_header(d)}</b>"]
-            current_day = d
-        day_lines.append(f"{pick_emoji(r['text'])} {r['text']}")
-        day_lines.append(f"   🕐 <code>{dt:%H:%M}</code>")
-        items.append(("week", r["id"], f"{dt:%d.%m %H:%M} {r['text']}"))
-    if day_lines:
-        parts.append("\n".join(day_lines))
+    for d in sorted(days):
+        group = days[d]
+        timed = sorted((r for r in group if not r["flexible"]), key=lambda r: r["remind_at"])
+        flex = sorted((r for r in group if r["flexible"]), key=lambda r: r["ord"])
+        lines = [f"📅 <b>{ru_date_header(d)}</b>"]
+        for r in timed:
+            dt = datetime.fromisoformat(r["remind_at"])
+            lines.append(f"🕐 <code>{dt:%H:%M}</code> {pick_emoji(r['text'])} {r['text']}")
+            items.append(("week", r["id"], f"{dt:%d.%m %H:%M} {r['text']}"))
+        for r in flex:
+            lines.append(f"📝 {pick_emoji(r['text'])} {r['text']}")
+            items.append(("week", r["id"], f"{_day_label(d, tz)} {r['text']}"))
+        parts.append("\n".join(lines))
 
     body = "\n\n".join(parts)  # пустая строка между днями
     return f"🗓 <b>Задачи на неделю:</b>\n\n{body}", _item_keyboard(items)
 
 
 def render_list(user_id: int, tz: ZoneInfo):
-    reminders = [r for r in get_active_reminders(user_id) if r["recurrence"] == "none"]
-    if not reminders:
+    rows = get_active_reminders(user_id)
+    timed = [r for r in rows if not r["flexible"] and r["recurrence"] == "none"]
+    flex = [r for r in rows if r["flexible"]]
+    if not timed and not flex:
         return "✨ Задач нет. Просто напиши, что и когда напомнить.", None
 
-    reminders.sort(key=lambda r: r["remind_at"])
-    blocks, items = [], []
-    for i, r in enumerate(reminders, 1):
-        dt = datetime.fromisoformat(r["remind_at"])
-        blocks.append(f"{i}. {pick_emoji(r['text'])} {r['text']}\n   📅 <code>{format_when(dt, tz)}</code>")
-        items.append(("list", r["id"], f"{dt:%d.%m %H:%M} {r['text']}"))
-    body = "\n\n".join(blocks)
+    parts, items = [], []
+    if timed:
+        timed.sort(key=lambda r: r["remind_at"])
+        block = ["⏰ <b>По времени:</b>"]
+        for r in timed:
+            dt = datetime.fromisoformat(r["remind_at"])
+            block.append(f"🕐 <code>{format_when(dt, tz)}</code> {pick_emoji(r['text'])} {r['text']}")
+            items.append(("list", r["id"], f"{dt:%d.%m %H:%M} {r['text']}"))
+        parts.append("\n".join(block))
+    if flex:
+        flex.sort(key=lambda r: (r["remind_at"], r["ord"]))
+        block = ["📝 <b>Без времени:</b>"]
+        for i, r in enumerate(flex, 1):
+            d = datetime.fromisoformat(r["remind_at"]).date()
+            block.append(f"{i}. {pick_emoji(r['text'])} {r['text']}  <code>{_day_label(d, tz)}</code>")
+            items.append(("list", r["id"], r["text"]))
+        parts.append("\n".join(block))
+
+    body = "\n\n".join(parts)
     return f"📋 <b>Все задачи:</b>\n\n{body}", _item_keyboard(items)
 
 

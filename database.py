@@ -78,6 +78,12 @@ def init_db(owner_id: int = None):
     if "done_at" not in columns:
         conn.execute("ALTER TABLE reminders ADD COLUMN done_at TEXT")
 
+    # Задачи без времени (чек-лист): flexible=1 и порядковый номер ord.
+    if "flexible" not in columns:
+        conn.execute("ALTER TABLE reminders ADD COLUMN flexible INTEGER NOT NULL DEFAULT 0")
+    if "ord" not in columns:
+        conn.execute("ALTER TABLE reminders ADD COLUMN ord INTEGER NOT NULL DEFAULT 0")
+
     # Любые осиротевшие задачи (user_id IS NULL) отдаём владельцу, чтобы не потерять.
     if owner_id is not None:
         conn.execute("UPDATE reminders SET user_id = ? WHERE user_id IS NULL", (owner_id,))
@@ -135,22 +141,37 @@ def set_user_timezone(user_id: int, timezone: str):
 
 # ───────────────────────── Задачи (всё в рамках user_id) ──────────────────────────
 
-def add_reminder(user_id: int, text: str, remind_at: str, recurrence: str = "none") -> int:
+def add_reminder(user_id: int, text: str, remind_at: str, recurrence: str = "none",
+                 flexible: int = 0, ord: int = 0) -> int:
     """
-    Добавляет напоминание пользователю.
-    remind_at — строка ISO 'YYYY-MM-DD HH:MM' (в местном времени пользователя).
-    recurrence — 'none' (разовое) или 'yearly' (ежегодное, для дней рождения).
+    Добавляет напоминание/задачу пользователю.
+    remind_at — 'YYYY-MM-DD HH:MM' (с временем) либо 'YYYY-MM-DD' (без времени, flexible).
+    recurrence — 'none' (разовое) или 'yearly' (ежегодное).
+    flexible — 1 для задачи без времени (чек-лист), ord — её позиция в списке.
     Возвращает id созданной записи.
     """
     conn = get_connection()
     cursor = conn.execute(
-        "INSERT INTO reminders (user_id, text, remind_at, recurrence) VALUES (?, ?, ?, ?)",
-        (user_id, text, remind_at, recurrence),
+        "INSERT INTO reminders (user_id, text, remind_at, recurrence, flexible, ord) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (user_id, text, remind_at, recurrence, flexible, ord),
     )
     conn.commit()
     new_id = cursor.lastrowid
     conn.close()
     return new_id
+
+
+def next_flexible_ord(user_id: int, day_iso: str) -> int:
+    """Следующий порядковый номер для задачи без времени на указанный день."""
+    conn = get_connection()
+    row = conn.execute(
+        "SELECT COALESCE(MAX(ord), 0) + 1 AS n FROM reminders "
+        "WHERE user_id = ? AND flexible = 1 AND done = 0 AND remind_at = ?",
+        (user_id, day_iso),
+    ).fetchone()
+    conn.close()
+    return row["n"]
 
 
 def get_active_reminders(user_id: int):
