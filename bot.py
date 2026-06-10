@@ -141,6 +141,7 @@ def _help_text() -> str:
         "Команды:\n"
         "/today · /week · /upcoming · /birthdays — списки\n"
         "/digest 08:00 — утренний дайджест (или /digest off)\n"
+        "/timezone — сменить часовой пояс\n"
         "/add 15:00 текст · /done 3"
     )
 
@@ -1349,6 +1350,20 @@ async def cmd_digest(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"☀️ Буду присылать дайджест дня в <b>{arg}</b>.", parse_mode="HTML")
 
 
+async def cmd_timezone(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Сменить часовой пояс — переиспользует онбординг (кнопки/город)."""
+    if not is_allowed(update):
+        return
+    uid = update.effective_user.id
+    current = get_user_timezone(uid)
+    context.user_data["awaiting_tz"] = True
+    await update.message.reply_text(
+        f"🌍 Сейчас твой пояс: <b>{current}</b>.\n"
+        "Выбери новый кнопкой или напиши свой город:",
+        parse_mode="HTML", reply_markup=_tz_keyboard(),
+    )
+
+
 async def cmd_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update):
         return
@@ -1544,6 +1559,7 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("list",  cmd_list))
     app.add_handler(CommandHandler("birthdays", cmd_birthdays))
     app.add_handler(CommandHandler("digest", cmd_digest))
+    app.add_handler(CommandHandler("timezone", cmd_timezone))
     app.add_handler(CommandHandler("done",  cmd_done))
     # Админ: выдать/забрать доступ
     app.add_handler(CommandHandler("allow", cmd_allow))
