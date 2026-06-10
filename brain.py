@@ -113,6 +113,10 @@ def _build_system_prompt(now: datetime) -> str:
    scope: "today" (что сегодня), "tomorrow" (завтра), "week" (на неделю),
    "upcoming" (что впереди/в этом месяце/далеко), "birthdays" (дни рождения),
    "search" (найти конкретное дело — тогда в text положи что искать, напр. «врач»).
+7. {{"type": "complete", "text": "..."}}
+   — отметить задачу ВЫПОЛНЕННОЙ. Слова «сделал», «выполнил», «закрыл»,
+   «готово с X», «сходил на X». text — что закрыть. НЕ путай с delete («удали»):
+   complete = дело сделано, delete = убрать из списка/отменить.
 
 ПРАВИЛА:
 - В поле text — ТОЛЬКО чистая суть, с заглавной буквы. Вырезай мусорные слова:
@@ -134,7 +138,7 @@ def _build_system_prompt(now: datetime) -> str:
 
 
 # Разрешённые типы действий — всё лишнее от модели отфильтруем.
-_VALID_TYPES = {"task", "birthday", "delete", "reschedule", "interval", "query"}
+_VALID_TYPES = {"task", "birthday", "delete", "reschedule", "interval", "query", "complete"}
 
 
 def _strip_fences(raw: str) -> str:

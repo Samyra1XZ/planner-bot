@@ -323,6 +323,24 @@ def count_done_on(user_id: int, day_iso: str) -> int:
     return row["c"]
 
 
+def get_completed_on(user_id: int, day_iso: str):
+    """Тексты задач, закрытых в указанный день: разовые (done) + повторы (instances)."""
+    conn = get_connection()
+    once = conn.execute(
+        "SELECT text FROM reminders WHERE user_id = ? AND done = 1 AND done_at LIKE ? "
+        "ORDER BY done_at",
+        (user_id, day_iso + "%"),
+    ).fetchall()
+    inst = conn.execute(
+        "SELECT r.text AS text FROM done_instances di "
+        "JOIN reminders r ON r.id = di.reminder_id "
+        "WHERE di.user_id = ? AND di.day = ?",
+        (user_id, day_iso),
+    ).fetchall()
+    conn.close()
+    return [row["text"] for row in once] + [row["text"] for row in inst]
+
+
 def mark_instance_done(user_id: int, reminder_id: int, day: str):
     """Отмечает повторяющуюся задачу выполненной НА ДЕНЬ day ('YYYY-MM-DD')."""
     conn = get_connection()

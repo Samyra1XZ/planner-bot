@@ -18,7 +18,7 @@ from apscheduler.triggers.cron import CronTrigger
 from database import (
     init_db, add_reminder, get_active_reminders, get_all_active_reminders, mark_done,
     delete_reminder, get_reminder_by_id, update_reminder_time, count_done_on,
-    mark_instance_done, is_instance_done, count_instances_done_on,
+    mark_instance_done, is_instance_done, count_instances_done_on, get_completed_on,
     next_flexible_ord, update_reminder_ord, ensure_user, get_user_timezone,
     get_user, get_all_users, set_user_digest,
     set_user_timezone, mark_onboarded, is_user_allowed, allow_user, deny_user,
@@ -136,13 +136,12 @@ def _help_text() -> str:
         "<i>каждый будний день в 9 планёрка</i> (повтор)\n"
         "<i>ДР мамы 20 августа</i>\n"
         "<i>напомни про созвон каждые 15 минут 3 раза</i>\n"
-        "<i>перенеси зал на 18:00</i> · <i>удали созвон</i>\n"
+        "<i>перенеси зал на 18:00</i> · <i>удали созвон</i> · <i>сделал зал</i>\n"
         "А ещё можно спрашивать: <i>что у меня завтра?</i>, <i>когда я к врачу?</i>\n\n"
         "Команды:\n"
         "/today · /week · /upcoming · /birthdays — списки\n"
-        "/digest 08:00 — утренний дайджест (или /digest off)\n"
-        "/timezone — сменить часовой пояс\n"
-        "/add 15:00 текст · /done 3"
+        "/done — что сделано сегодня · /digest 08:00 · /timezone\n"
+        "/help — эта подсказка"
     )
 
 
@@ -371,8 +370,19 @@ def _do_birthday(context, action: dict, user_id: int, tz: ZoneInfo) -> str:
     return f"✅ Запомнил ДР: 🎂 {name} — {ru_day_month(d)} <i>(напомню за 2 дня и утром)</i>"
 
 
+def _choice_keyboard(matches, prefix: str) -> InlineKeyboardMarkup:
+    """Кнопки выбора задачи при неоднозначности. prefix 'del' (удалить) или 'done' (выполнить)."""
+    icon = "✅" if prefix == "done" else "🗑"
+    rows = [
+        [InlineKeyboardButton(f"{icon} {_short(_match_label(r))}",
+                              callback_data=f"{prefix}:list:{r['id']}")]
+        for r in matches
+    ]
+    return InlineKeyboardMarkup(rows)
+
+
 def _do_delete(action: dict, user_id: int, pending_buttons: list) -> str:
-    """Удаляет задачу по описанию. Несколько похожих → кнопки в pending_buttons."""
+    """Удаляет задачу по описанию. Несколько похожих → кнопки выбора."""
     query = (action.get("text") or "").strip()
     matches = find_matches(query, user_id)
     if not matches:
@@ -382,9 +392,33 @@ def _do_delete(action: dict, user_id: int, pending_buttons: list) -> str:
         delete_reminder(user_id, r["id"])
         unschedule_reminder(r["id"])
         return f"🗑 Удалил: {r['text']}"
-    items = [("list", r["id"], _match_label(r)) for r in matches]
-    pending_buttons.append((f"❓ Несколько похожих на «{query}» — что удалить?", items))
+    pending_buttons.append((f"❓ Несколько похожих на «{query}» — что удалить?",
+                            _choice_keyboard(matches, "del")))
     return None  # отчёт не нужен, будут кнопки
+
+
+def _complete_reminder(user_id: int, r, tz: ZoneInfo):
+    """Закрывает задачу: повтор — только на сегодня; разовую — насовсем (со снятием джобов)."""
+    if is_recurring(r["recurrence"]):
+        mark_instance_done(user_id, r["id"], datetime.now(tz).date().isoformat())
+    else:
+        mark_done(user_id, r["id"], datetime.now(tz).strftime("%Y-%m-%d %H:%M"))
+        unschedule_reminder(r["id"])
+
+
+def _do_complete(action: dict, user_id: int, tz: ZoneInfo, pending_buttons: list) -> str:
+    """Отмечает задачу выполненной по описанию (голосом «сделал X»)."""
+    query = (action.get("text") or "").strip()
+    matches = find_matches(query, user_id)
+    if not matches:
+        return f"🤷 Не нашёл, что отметить: «{query}»"
+    if len(matches) == 1:
+        r = matches[0]
+        _complete_reminder(user_id, r, tz)
+        return f"✅ Выполнено: {r['text']}"
+    pending_buttons.append((f"❓ Несколько похожих на «{query}» — что отметить?",
+                            _choice_keyboard(matches, "done")))
+    return None
 
 
 def _do_reschedule(context, action: dict, user_id: int, tz: ZoneInfo) -> str:
@@ -440,6 +474,10 @@ def _execute_actions(context, actions: list, user_id: int, tz: ZoneInfo):
             report.append(_do_reschedule(context, action, user_id, tz))
         elif kind == "interval":
             report.append(_do_interval(context, action, user_id, tz))
+        elif kind == "complete":
+            line = _do_complete(action, user_id, tz, pending_buttons)
+            if line:
+                report.append(line)
     return report, pending_buttons
 
 
@@ -504,6 +542,15 @@ def _preview_actions(actions: list, user_id: int, tz: ZoneInfo) -> str:
                 lines.append(f"🔔 {pick_emoji(text)} {text} — {times}× каждые {_minutes_label(every)}")
             except (TypeError, ValueError):
                 lines.append(f"⚠️ напоминание «{text}» — не понял интервал/количество")
+        elif kind == "complete":
+            q = (a.get("text") or "").strip()
+            matches = find_matches(q, user_id)
+            if not matches:
+                lines.append(f"🤷 отметить «{q}» — не нашёл")
+            elif len(matches) == 1:
+                lines.append(f"✅ выполнено: {matches[0]['text']}")
+            else:
+                lines.append(f"✅ отметить «{q}» — несколько, выберу при подтверждении")
 
     body = "\n".join(f"• {line}" for line in lines)
     return f"🤔 Понял так — всё верно?\n\n{body}"
@@ -515,8 +562,8 @@ async def _send_results(send, report, pending_buttons):
     send — корутина-отправитель вида send(text, **kwargs) (reply или bot.send_message)."""
     if report:
         await send("\n".join(report), parse_mode="HTML", reply_markup=build_menu())
-    for prompt, items in pending_buttons:
-        await send(prompt, reply_markup=_item_keyboard(items, with_done=False))
+    for prompt, markup in pending_buttons:
+        await send(prompt, reply_markup=markup)
 
 
 def _minutes_label(m: int) -> str:
@@ -1194,9 +1241,9 @@ async def on_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     summary = "✅ Сохранено:\n" + "\n".join(report) if report else "✅ Готово"
     await query.edit_message_text(summary, parse_mode="HTML")
 
-    # Неоднозначные удаления — отдельными сообщениями с кнопками выбора.
-    for prompt, items in pending_buttons:
-        await context.bot.send_message(uid, prompt, reply_markup=_item_keyboard(items, with_done=False))
+    # Неоднозначный выбор (удалить/выполнить) — отдельными сообщениями с кнопками.
+    for prompt, markup in pending_buttons:
+        await context.bot.send_message(uid, prompt, reply_markup=markup)
 
 
 async def on_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1364,12 +1411,28 @@ async def cmd_timezone(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update):
+        return
+    await update.message.reply_text(_help_text(), parse_mode="HTML", reply_markup=build_menu())
+
+
 async def cmd_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update):
         return
 
-    if len(context.args) != 1:
-        await update.message.reply_text("Формат: /done <номер>, например /done 3")
+    uid = update.effective_user.id
+
+    # /done без номера — список закрытого за сегодня.
+    if not context.args:
+        day = datetime.now(_tz(uid)).date().isoformat()
+        done = get_completed_on(uid, day)
+        if not done:
+            await update.message.reply_text("Сегодня пока ничего не закрыто. Вперёд! 💪")
+        else:
+            lines = ["✅ <b>Сделано сегодня:</b>", ""] + [f"• {t}" for t in done]
+            lines.append(f"\n<b>Итого: {len(done)}</b>")
+            await update.message.reply_text("\n".join(lines), parse_mode="HTML")
         return
 
     try:
@@ -1378,7 +1441,6 @@ async def cmd_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Номер должен быть числом, например: /done 3")
         return
 
-    uid = update.effective_user.id
     now = datetime.now(_tz(uid))
     success = mark_done(uid, reminder_id, now.strftime("%Y-%m-%d %H:%M"))
     if success:
@@ -1560,6 +1622,7 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("birthdays", cmd_birthdays))
     app.add_handler(CommandHandler("digest", cmd_digest))
     app.add_handler(CommandHandler("timezone", cmd_timezone))
+    app.add_handler(CommandHandler("help",  cmd_help))
     app.add_handler(CommandHandler("done",  cmd_done))
     # Админ: выдать/забрать доступ
     app.add_handler(CommandHandler("allow", cmd_allow))
