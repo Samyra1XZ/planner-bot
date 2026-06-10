@@ -59,10 +59,12 @@ def init_db(owner_id: int = None):
             user_id     INTEGER PRIMARY KEY,
             timezone    TEXT NOT NULL DEFAULT 'Asia/Makassar',
             language    TEXT NOT NULL DEFAULT 'ru',
-            digest_time TEXT NOT NULL DEFAULT '08:00',
-            digest_on   INTEGER NOT NULL DEFAULT 1,
-            onboarded   INTEGER NOT NULL DEFAULT 0,
-            created_at  TEXT NOT NULL DEFAULT (datetime('now'))
+            digest_time  TEXT NOT NULL DEFAULT '08:00',
+            digest_on    INTEGER NOT NULL DEFAULT 1,
+            evening_time TEXT NOT NULL DEFAULT '21:00',
+            evening_on   INTEGER NOT NULL DEFAULT 0,
+            onboarded    INTEGER NOT NULL DEFAULT 0,
+            created_at   TEXT NOT NULL DEFAULT (datetime('now'))
         )
     """)
 
@@ -90,6 +92,10 @@ def init_db(owner_id: int = None):
         conn.execute("ALTER TABLE users ADD COLUMN digest_time TEXT NOT NULL DEFAULT '08:00'")
     if "digest_on" not in ucolumns:
         conn.execute("ALTER TABLE users ADD COLUMN digest_on INTEGER NOT NULL DEFAULT 1")
+    if "evening_time" not in ucolumns:
+        conn.execute("ALTER TABLE users ADD COLUMN evening_time TEXT NOT NULL DEFAULT '21:00'")
+    if "evening_on" not in ucolumns:
+        conn.execute("ALTER TABLE users ADD COLUMN evening_on INTEGER NOT NULL DEFAULT 0")
     if "onboarded" not in ucolumns:
         conn.execute("ALTER TABLE users ADD COLUMN onboarded INTEGER NOT NULL DEFAULT 0")
 
@@ -222,6 +228,18 @@ def set_user_digest(user_id: int, digest_time: str = None, digest_on: int = None
         conn.execute("UPDATE users SET digest_time = ? WHERE user_id = ?", (digest_time, user_id))
     if digest_on is not None:
         conn.execute("UPDATE users SET digest_on = ? WHERE user_id = ?", (digest_on, user_id))
+    conn.commit()
+    conn.close()
+
+
+def set_user_evening(user_id: int, evening_time: str = None, evening_on: int = None):
+    """Меняет настройки вечернего обзора (время и/или вкл-выкл)."""
+    ensure_user(user_id)
+    conn = get_connection()
+    if evening_time is not None:
+        conn.execute("UPDATE users SET evening_time = ? WHERE user_id = ?", (evening_time, user_id))
+    if evening_on is not None:
+        conn.execute("UPDATE users SET evening_on = ? WHERE user_id = ?", (evening_on, user_id))
     conn.commit()
     conn.close()
 

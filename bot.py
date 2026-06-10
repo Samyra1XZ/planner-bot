@@ -20,7 +20,7 @@ from database import (
     delete_reminder, get_reminder_by_id, update_reminder_time, count_done_on,
     mark_instance_done, is_instance_done, count_instances_done_on, get_completed_on,
     next_flexible_ord, update_reminder_ord, ensure_user, get_user_timezone,
-    get_user, get_all_users, set_user_digest,
+    get_user, get_all_users, set_user_digest, set_user_evening,
     set_user_timezone, mark_onboarded, is_user_allowed, allow_user, deny_user,
 )
 from scheduler import (
@@ -140,8 +140,8 @@ def _help_text() -> str:
         "А ещё можно спрашивать: <i>что у меня завтра?</i>, <i>когда я к врачу?</i>\n\n"
         "Команды:\n"
         "/today · /week · /upcoming · /birthdays — списки\n"
-        "/done — что сделано сегодня · /digest 08:00 · /timezone\n"
-        "/help — эта подсказка"
+        "/done — что сделано сегодня · /digest 08:00 · /evening 21:00\n"
+        "/timezone · /help"
     )
 
 
@@ -714,6 +714,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     apply_user_digest(context.bot, uid)
+    apply_user_evening(context.bot, uid)
     await update.message.reply_text(_help_text(), parse_mode="HTML", reply_markup=build_menu())
 
 
@@ -1397,6 +1398,40 @@ async def cmd_digest(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"☀️ Буду присылать дайджест дня в <b>{arg}</b>.", parse_mode="HTML")
 
 
+async def cmd_evening(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Вечерний обзор: /evening 21:00 | off | (статус). По умолчанию выключен."""
+    if not is_allowed(update):
+        return
+    uid = update.effective_user.id
+
+    if not context.args:
+        u = get_user(uid)
+        state = f"приходит в <b>{u['evening_time']}</b>" if u and u["evening_on"] else "выключен"
+        await update.message.reply_text(
+            f"🌙 Вечерний обзор сейчас {state}.\n"
+            "Включить: <code>/evening 21:00</code>  ·  выключить: <code>/evening off</code>",
+            parse_mode="HTML",
+        )
+        return
+
+    arg = context.args[0].lower()
+    if arg in ("off", "выкл", "стоп", "0"):
+        set_user_evening(uid, evening_on=0)
+        apply_user_evening(context.bot, uid)
+        await update.message.reply_text("🌙 Вечерний обзор выключен.")
+        return
+
+    try:
+        datetime.strptime(arg, "%H:%M")
+    except ValueError:
+        await update.message.reply_text("Формат: <code>/evening 21:00</code>  или  <code>/evening off</code>", parse_mode="HTML")
+        return
+
+    set_user_evening(uid, evening_time=arg, evening_on=1)
+    apply_user_evening(context.bot, uid)
+    await update.message.reply_text(f"🌙 Вечерний обзор будет приходить в <b>{arg}</b>.", parse_mode="HTML")
+
+
 async def cmd_timezone(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Сменить часовой пояс — переиспользует онбординг (кнопки/город)."""
     if not is_allowed(update):
@@ -1590,15 +1625,54 @@ def apply_user_digest(bot, user_id: int):
         unschedule_digest(user_id)
 
 
+async def _send_evening_job(bot, user_id: int):
+    """Вечером шлёт: что осталось сегодня + что завтра."""
+    tz = _tz(user_id)
+    today = datetime.now(tz).date()
+    left = render_day_readonly(user_id, tz, today, "Осталось сегодня")
+    tomorrow = render_day_readonly(user_id, tz, today + timedelta(days=1), "Завтра")
+    await bot.send_message(
+        user_id, "🌙 <b>Вечерний обзор</b>\n\n" + left + "\n\n" + tomorrow,
+        parse_mode="HTML",
+    )
+
+
+def schedule_evening(bot, user_id: int, tz: ZoneInfo, hh: int, mm: int):
+    scheduler.add_job(
+        _send_evening_job, trigger=CronTrigger(hour=hh, minute=mm, timezone=tz),
+        args=[bot, user_id], id=f"evening_{user_id}", replace_existing=True,
+    )
+
+
+def unschedule_evening(user_id: int):
+    try:
+        scheduler.remove_job(f"evening_{user_id}")
+    except Exception:
+        pass
+
+
+def apply_user_evening(bot, user_id: int):
+    """Включает/выключает вечерний обзор по настройкам пользователя."""
+    u = get_user(user_id)
+    if not u:
+        return
+    if u["evening_on"] and u["evening_time"]:
+        hh, mm = map(int, u["evening_time"].split(":"))
+        schedule_evening(bot, user_id, _tz(user_id), hh, mm)
+    else:
+        unschedule_evening(user_id)
+
+
 # ───────────────────────── Запуск ──────────────────────────
 
 async def on_startup(application: Application):
     scheduler.start()
     reminders = get_all_active_reminders()       # напоминания всех пользователей
     reschedule_all(application.bot, reminders)
-    # Планируем утренний дайджест каждому пользователю в его время и таймзоне.
+    # Планируем утренний дайджест и вечерний обзор каждому пользователю.
     for u in get_all_users():
         apply_user_digest(application.bot, u["user_id"])
+        apply_user_evening(application.bot, u["user_id"])
     print(f"Восстановлено напоминаний из базы: {len(reminders)}")
 
 
@@ -1621,6 +1695,7 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("list",  cmd_list))
     app.add_handler(CommandHandler("birthdays", cmd_birthdays))
     app.add_handler(CommandHandler("digest", cmd_digest))
+    app.add_handler(CommandHandler("evening", cmd_evening))
     app.add_handler(CommandHandler("timezone", cmd_timezone))
     app.add_handler(CommandHandler("help",  cmd_help))
     app.add_handler(CommandHandler("done",  cmd_done))
