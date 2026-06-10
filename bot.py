@@ -60,6 +60,7 @@ def _tz(user_id: int) -> ZoneInfo:
 # перехватываем его в handle_text ДО разбора через Gemini.
 MENU_TODAY = "📋 Сегодня"
 MENU_WEEK = "🗓 Неделя"
+MENU_UPCOMING = "📆 Впереди"
 MENU_BDAY = "🎂 Дни рождения"
 MENU_LIST = "📝 Все задачи"
 MENU_ADD = "➕ Новая задача"
@@ -68,7 +69,7 @@ MENU_ADD = "➕ Новая задача"
 def build_menu() -> ReplyKeyboardMarkup:
     """Постоянное меню внизу экрана — навигация тапами, без ввода команд."""
     return ReplyKeyboardMarkup(
-        [[MENU_TODAY, MENU_WEEK], [MENU_BDAY, MENU_LIST], [MENU_ADD]],
+        [[MENU_TODAY, MENU_WEEK], [MENU_UPCOMING, MENU_BDAY], [MENU_LIST, MENU_ADD]],
         resize_keyboard=True,    # компактные кнопки по размеру текста
         is_persistent=True,      # меню не прячется после нажатия
     )
@@ -110,7 +111,7 @@ def _help_text() -> str:
         "<i>ДР мамы 20 августа</i>\n"
         "<i>перенеси зал на 18:00</i> · <i>удали созвон</i>\n\n"
         "Команды:\n"
-        "/today · /week · /birthdays — списки\n"
+        "/today · /week · /upcoming · /birthdays — списки\n"
         "/digest 08:00 — утренний дайджест (или /digest off)\n"
         "/add 15:00 текст · /done 3"
     )
@@ -618,6 +619,10 @@ RU_MONTHS_GEN = [
     "января", "февраля", "марта", "апреля", "мая", "июня",
     "июля", "августа", "сентября", "октября", "ноября", "декабря",
 ]
+RU_MONTHS_NOM = [
+    "Январь", "Февраль", "Март", "Апрель", "Май", "Июнь",
+    "Июль", "Август", "Сентябрь", "Октябрь", "Ноябрь", "Декабрь",
+]
 
 
 def ru_day_month(d: date) -> str:
@@ -848,15 +853,47 @@ def render_birthdays(user_id: int, tz: ZoneInfo):
     return f"🎂 <b>Дни рождения:</b>\n\n{body}", _item_keyboard(items, with_done=False)
 
 
+def render_upcoming(user_id: int, tz: ZoneInfo):
+    """Все запланированные разовые события на месяцы вперёд, по месяцам («годовая память»)."""
+    today = datetime.now(tz).date()
+    by_month = {}
+    for r in get_active_reminders(user_id):
+        if r["flexible"] or r["recurrence"] != "none":
+            continue  # только разовые дела с датой (повторы — в /list, ДР — в /birthdays)
+        d = datetime.fromisoformat(r["remind_at"]).date()
+        if d >= today:
+            by_month.setdefault((d.year, d.month), []).append(r)
+
+    if not by_month:
+        return "📆 Впереди пока ничего не запланировано.", None
+
+    parts, items = [], []
+    for (y, m) in sorted(by_month):
+        group = sorted(by_month[(y, m)], key=lambda r: r["remind_at"])
+        # Заголовок месяца; год добавляем, если он не текущий.
+        title = RU_MONTHS_NOM[m - 1] + ("" if y == today.year else f" {y}")
+        lines = [f"📆 <b>{title}</b>"]
+        for r in group:
+            dt = datetime.fromisoformat(r["remind_at"])
+            lines.append(f"🕐 <code>{dt:%d.%m %H:%M}</code> {pick_emoji(r['text'])} {r['text']}")
+            items.append(("upcoming", r["id"], f"{dt:%d.%m %H:%M} {r['text']}"))
+        parts.append("\n".join(lines))
+
+    body = "\n\n".join(parts)
+    return f"📆 <b>Впереди:</b>\n\n{body}", _item_keyboard(items)
+
+
 # Сопоставление имени вида с его рендером — нужно при перерисовке после удаления.
 RENDERERS = {
     "today": render_today, "week": render_week,
     "list": render_list, "bday": render_birthdays,
+    "upcoming": render_upcoming,
 }
 
 # Кнопка нижнего меню → какой список показать.
 MENU_RENDERERS = {
     MENU_TODAY: render_today, MENU_WEEK: render_week,
+    MENU_UPCOMING: render_upcoming,
     MENU_BDAY: render_birthdays, MENU_LIST: render_list,
 }
 
@@ -890,6 +927,14 @@ async def cmd_birthdays(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     uid = update.effective_user.id
     text, markup = render_birthdays(uid, _tz(uid))
+    await update.message.reply_text(text, parse_mode="HTML", reply_markup=markup)
+
+
+async def cmd_upcoming(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update):
+        return
+    uid = update.effective_user.id
+    text, markup = render_upcoming(uid, _tz(uid))
     await update.message.reply_text(text, parse_mode="HTML", reply_markup=markup)
 
 
@@ -1298,6 +1343,7 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("add",   cmd_add))
     app.add_handler(CommandHandler("today", cmd_today))
     app.add_handler(CommandHandler("week",  cmd_week))
+    app.add_handler(CommandHandler("upcoming", cmd_upcoming))
     app.add_handler(CommandHandler("list",  cmd_list))
     app.add_handler(CommandHandler("birthdays", cmd_birthdays))
     app.add_handler(CommandHandler("digest", cmd_digest))

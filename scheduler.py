@@ -146,6 +146,24 @@ def schedule_reminder(bot, chat_id: int, reminder_id: int, text: str,
             replace_existing=True,
         )
 
+    # Проактивные напоминания о ДАЛЁКИХ задачах («годовая память»):
+    # чтобы дело через недели/месяцы не выпало из головы — пингуем заранее.
+    days_ahead = (dt.date() - now.date()).days
+    day_before = (dt - timedelta(days=1)).replace(hour=9, minute=0)
+    if days_ahead >= 2 and day_before > now:
+        scheduler.add_job(
+            _send_reminder, trigger="date", run_date=day_before,
+            args=[bot, chat_id, f"⏳ Завтра: {text} (в {dt:%H:%M})"],
+            id=f"{reminder_id}_d1", replace_existing=True,
+        )
+    week_before = (dt - timedelta(days=7)).replace(hour=9, minute=0)
+    if days_ahead >= 9 and week_before > now:
+        scheduler.add_job(
+            _send_reminder, trigger="date", run_date=week_before,
+            args=[bot, chat_id, f"📅 Через неделю: {text} ({dt:%d.%m} в {dt:%H:%M})"],
+            id=f"{reminder_id}_w1", replace_existing=True,
+        )
+
     return True
 
 
@@ -157,6 +175,7 @@ def unschedule_reminder(reminder_id: int):
     """
     for job_id in (
         str(reminder_id), f"{reminder_id}_pre",
+        f"{reminder_id}_d1", f"{reminder_id}_w1",
         f"{reminder_id}_bd2", f"{reminder_id}_bd0",
     ):
         try:
