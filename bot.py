@@ -13,11 +13,13 @@ from telegram import (
 from telegram.ext import (
     Application, CommandHandler, ContextTypes, MessageHandler, CallbackQueryHandler, filters,
 )
+from apscheduler.triggers.cron import CronTrigger
 
 from database import (
     init_db, add_reminder, get_active_reminders, get_all_active_reminders, mark_done,
     delete_reminder, get_reminder_by_id, update_reminder_time, count_done_on,
     next_flexible_ord, ensure_user, get_user_timezone,
+    get_user, get_all_users, set_user_digest,
 )
 from scheduler import scheduler, schedule_reminder, reschedule_all, unschedule_reminder, TZ
 from stt import transcribe
@@ -464,7 +466,9 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_owner(update):
         return
 
-    ensure_user(update.effective_user.id)  # заводим пользователя с таймзоной по умолчанию
+    uid = update.effective_user.id
+    ensure_user(uid)                    # заводим пользователя с настройками по умолчанию
+    apply_user_digest(context.bot, uid)  # включаем утренний дайджест (по умолчанию 08:00)
 
     await update.message.reply_text(
         "Привет! Я твой личный планер. ⏱ Время — по Бали (UTC+8).\n\n"
@@ -480,6 +484,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/today — задачи на сегодня\n"
         "/week — задачи на 7 дней вперёд\n"
         "/birthdays — дни рождения\n"
+        "/digest 08:00 — утренний дайджест (или /digest off)\n"
         "/add 15:00 текст — задача на сегодня\n"
         "/done 3 — отметить выполненной",
         parse_mode="HTML",
@@ -916,6 +921,40 @@ async def on_done_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.edit_message_text(text, parse_mode="HTML", reply_markup=markup)
 
 
+async def cmd_digest(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Настройка утреннего дайджеста: /digest 08:00 | /digest off | /digest (статус)."""
+    if not is_owner(update):
+        return
+    uid = update.effective_user.id
+
+    if not context.args:
+        u = get_user(uid)
+        state = f"приходит в <b>{u['digest_time']}</b>" if u and u["digest_on"] else "выключен"
+        await update.message.reply_text(
+            f"☀️ Утренний дайджест сейчас {state}.\n"
+            "Изменить: <code>/digest 08:00</code>  ·  выключить: <code>/digest off</code>",
+            parse_mode="HTML",
+        )
+        return
+
+    arg = context.args[0].lower()
+    if arg in ("off", "выкл", "стоп", "0"):
+        set_user_digest(uid, digest_on=0)
+        apply_user_digest(context.bot, uid)
+        await update.message.reply_text("🌙 Утренний дайджест выключен.")
+        return
+
+    try:
+        datetime.strptime(arg, "%H:%M")
+    except ValueError:
+        await update.message.reply_text("Формат: <code>/digest 08:00</code>  или  <code>/digest off</code>", parse_mode="HTML")
+        return
+
+    set_user_digest(uid, digest_time=arg, digest_on=1)
+    apply_user_digest(context.bot, uid)
+    await update.message.reply_text(f"☀️ Буду присылать дайджест дня в <b>{arg}</b>.", parse_mode="HTML")
+
+
 async def cmd_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_owner(update):
         return
@@ -1010,12 +1049,60 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await process_free_text(update, context, text)
 
 
+# ───────────────────────── Утренний дайджест ──────────────────────────
+
+async def _send_digest_job(bot, user_id: int):
+    """Шлёт утренний дайджест: задачи на сегодня (или «свободный день»)."""
+    tz = _tz(user_id)
+    text, markup = render_today(user_id, tz)
+    if markup is None:  # на сегодня пусто
+        await bot.send_message(user_id, "☀️ Доброе утро! На сегодня задач нет — свободный день 🎉")
+    else:
+        await bot.send_message(
+            user_id, "☀️ <b>Доброе утро!</b>\n\n" + text,
+            parse_mode="HTML", reply_markup=markup,
+        )
+
+
+def schedule_digest(bot, user_id: int, tz: ZoneInfo, hh: int, mm: int):
+    """Ставит ежедневный cron-джоб дайджеста в личное время пользователя."""
+    scheduler.add_job(
+        _send_digest_job,
+        trigger=CronTrigger(hour=hh, minute=mm, timezone=tz),
+        args=[bot, user_id],
+        id=f"digest_{user_id}",
+        replace_existing=True,
+    )
+
+
+def unschedule_digest(user_id: int):
+    try:
+        scheduler.remove_job(f"digest_{user_id}")
+    except Exception:
+        pass
+
+
+def apply_user_digest(bot, user_id: int):
+    """Включает/выключает дайджест по настройкам пользователя."""
+    u = get_user(user_id)
+    if not u:
+        return
+    if u["digest_on"] and u["digest_time"]:
+        hh, mm = map(int, u["digest_time"].split(":"))
+        schedule_digest(bot, user_id, _tz(user_id), hh, mm)
+    else:
+        unschedule_digest(user_id)
+
+
 # ───────────────────────── Запуск ──────────────────────────
 
 async def on_startup(application: Application):
     scheduler.start()
     reminders = get_all_active_reminders()       # напоминания всех пользователей
     reschedule_all(application.bot, reminders)
+    # Планируем утренний дайджест каждому пользователю в его время и таймзоне.
+    for u in get_all_users():
+        apply_user_digest(application.bot, u["user_id"])
     print(f"Восстановлено напоминаний из базы: {len(reminders)}")
 
 
@@ -1036,6 +1123,7 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("week",  cmd_week))
     app.add_handler(CommandHandler("list",  cmd_list))
     app.add_handler(CommandHandler("birthdays", cmd_birthdays))
+    app.add_handler(CommandHandler("digest", cmd_digest))
     app.add_handler(CommandHandler("done",  cmd_done))
 
     # Нажатия кнопок: подтверждение разбора, снуз, ✅ выполнено, 🗑 удаление

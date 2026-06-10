@@ -56,12 +56,21 @@ def init_db(owner_id: int = None):
     # ── Таблица пользователей (для мультиюзера и личной таймзоны) ──
     conn.execute("""
         CREATE TABLE IF NOT EXISTS users (
-            user_id    INTEGER PRIMARY KEY,
-            timezone   TEXT NOT NULL DEFAULT 'Asia/Makassar',
-            language   TEXT NOT NULL DEFAULT 'ru',
-            created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            user_id     INTEGER PRIMARY KEY,
+            timezone    TEXT NOT NULL DEFAULT 'Asia/Makassar',
+            language    TEXT NOT NULL DEFAULT 'ru',
+            digest_time TEXT NOT NULL DEFAULT '08:00',
+            digest_on   INTEGER NOT NULL DEFAULT 1,
+            created_at  TEXT NOT NULL DEFAULT (datetime('now'))
         )
     """)
+
+    # Миграция users: добавляем настройки утреннего дайджеста, если их ещё нет.
+    ucolumns = [row["name"] for row in conn.execute("PRAGMA table_info(users)")]
+    if "digest_time" not in ucolumns:
+        conn.execute("ALTER TABLE users ADD COLUMN digest_time TEXT NOT NULL DEFAULT '08:00'")
+    if "digest_on" not in ucolumns:
+        conn.execute("ALTER TABLE users ADD COLUMN digest_on INTEGER NOT NULL DEFAULT 1")
 
     # ── Миграции со старых схем ──
     columns = [row["name"] for row in conn.execute("PRAGMA table_info(reminders)")]
@@ -135,6 +144,26 @@ def set_user_timezone(user_id: int, timezone: str):
     ensure_user(user_id)
     conn = get_connection()
     conn.execute("UPDATE users SET timezone = ? WHERE user_id = ?", (timezone, user_id))
+    conn.commit()
+    conn.close()
+
+
+def get_all_users():
+    """Все пользователи — для планирования дайджестов при старте бота."""
+    conn = get_connection()
+    rows = conn.execute("SELECT * FROM users").fetchall()
+    conn.close()
+    return rows
+
+
+def set_user_digest(user_id: int, digest_time: str = None, digest_on: int = None):
+    """Меняет настройки утреннего дайджеста (время и/или вкл-выкл). Создаёт юзера."""
+    ensure_user(user_id)
+    conn = get_connection()
+    if digest_time is not None:
+        conn.execute("UPDATE users SET digest_time = ? WHERE user_id = ?", (digest_time, user_id))
+    if digest_on is not None:
+        conn.execute("UPDATE users SET digest_on = ? WHERE user_id = ?", (digest_on, user_id))
     conn.commit()
     conn.close()
 
