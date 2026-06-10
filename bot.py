@@ -22,7 +22,9 @@ from database import (
     get_user, get_all_users, set_user_digest,
     set_user_timezone, mark_onboarded, is_user_allowed, allow_user, deny_user,
 )
-from scheduler import scheduler, schedule_reminder, reschedule_all, unschedule_reminder, TZ
+from scheduler import (
+    scheduler, schedule_reminder, reschedule_all, unschedule_reminder, is_recurring, TZ,
+)
 from stt import transcribe
 import brain  # «мозг» разбора на Gemini
 
@@ -218,8 +220,10 @@ def _day_label(d: date, tz: ZoneInfo) -> str:
     return format_date(d, tz)
 
 
-# Повторы. Множественная форма для подписи «по понедельникам» и т.п.
-RECURRING = ("daily", "weekdays", "weekly")
+# Повторы. Сокращения дней недели (Пн=0) и их формы для подписей.
+WD_ABBR = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
+WD_SHORT_RU = {"mon": "пн", "tue": "вт", "wed": "ср", "thu": "чт",
+               "fri": "пт", "sat": "сб", "sun": "вс"}
 WEEKDAY_EVERY = [
     "понедельникам", "вторникам", "средам", "четвергам",
     "пятницам", "субботам", "воскресеньям",
@@ -227,25 +231,44 @@ WEEKDAY_EVERY = [
 
 
 def _repeat_label(recurrence: str, dt: datetime) -> str:
-    """Человеческая подпись повтора: 'каждый день' / 'по будням' / 'по понедельникам'."""
+    """Подпись повтора: 'каждый день' / 'по будням' / 'по понедельникам' / '5-го числа' и т.п."""
     if recurrence == "daily":
         return "каждый день"
     if recurrence == "weekdays":
         return "по будням"
     if recurrence == "weekly":
         return f"по {WEEKDAY_EVERY[dt.weekday()]}"
+    if recurrence == "monthly":
+        return f"{dt.day}-го числа"
+    if recurrence.startswith("wd:"):
+        days = recurrence.split(":", 1)[1].split(",")
+        return "по " + ", ".join(WD_SHORT_RU.get(x, x) for x in days)
+    if recurrence.startswith("weeks:"):
+        n = recurrence.split(":", 1)[1]
+        return f"раз в {n} нед. ({WD_SHORT_RU.get(WD_ABBR[dt.weekday()])})"
     return ""
 
 
 def _recurs_on(r, d: date) -> bool:
     """Выпадает ли повторяющаяся задача r на дату d."""
     rec = r["recurrence"]
+    start = datetime.fromisoformat(r["remind_at"])
     if rec == "daily":
         return True
     if rec == "weekdays":
         return d.weekday() < 5
     if rec == "weekly":
-        return datetime.fromisoformat(r["remind_at"]).weekday() == d.weekday()
+        return start.weekday() == d.weekday()
+    if rec == "monthly":
+        return start.day == d.day
+    if rec.startswith("wd:"):
+        return WD_ABBR[d.weekday()] in rec.split(":", 1)[1].split(",")
+    if rec.startswith("weeks:"):
+        n = int(rec.split(":", 1)[1])
+        if start.weekday() != d.weekday():
+            return False
+        delta = (d - start.date()).days
+        return delta >= 0 and delta % (7 * n) == 0
     return False
 
 
@@ -300,7 +323,7 @@ def _do_task(context, action: dict, user_id: int, tz: ZoneInfo) -> str:
 
     # Повторяющаяся задача → cron-напоминание (повтор требует времени, нет → 09:00).
     repeat = (action.get("repeat") or "").strip().lower()
-    if repeat in RECURRING:
+    if is_recurring(repeat):
         if hm is None:
             hm = (9, 0)
         dt = datetime(day.year, day.month, day.day, hm[0], hm[1])
@@ -431,7 +454,7 @@ def _preview_actions(actions: list, user_id: int, tz: ZoneInfo) -> str:
             repeat = (a.get("repeat") or "").strip().lower()
             try:
                 day, hm = _parse_task_when(a.get("datetime"))
-                if repeat in RECURRING:
+                if is_recurring(repeat):
                     hh, mm = hm if hm else (9, 0)
                     dt = datetime(day.year, day.month, day.day, hh, mm)
                     lines.append(f"🔁 {pick_emoji(text)} {text} — {_repeat_label(repeat, dt)} в {dt:%H:%M}")
@@ -815,7 +838,7 @@ def render_today(user_id: int, tz: ZoneInfo):
         elif r["recurrence"] == "none":
             if datetime.fromisoformat(r["remind_at"]).date() == today:
                 timed.append((datetime.fromisoformat(r["remind_at"]), r, False))
-        elif r["recurrence"] in RECURRING and _recurs_on(r, today):
+        elif is_recurring(r["recurrence"]) and _recurs_on(r, today):
             timed.append((datetime.fromisoformat(r["remind_at"]), r, True))
 
     if not timed and not flex:
@@ -862,7 +885,7 @@ def render_week(user_id: int, tz: ZoneInfo):
             elif r["recurrence"] == "none":
                 if datetime.fromisoformat(r["remind_at"]).date() == d:
                     day_timed.append((datetime.fromisoformat(r["remind_at"]), r, False))
-            elif r["recurrence"] in RECURRING and _recurs_on(r, d):
+            elif is_recurring(r["recurrence"]) and _recurs_on(r, d):
                 day_timed.append((datetime.fromisoformat(r["remind_at"]), r, True))
 
         if not day_timed and not day_flex:
@@ -892,7 +915,7 @@ def render_week(user_id: int, tz: ZoneInfo):
 def render_list(user_id: int, tz: ZoneInfo):
     rows = get_active_reminders(user_id)
     timed = [r for r in rows if not r["flexible"] and r["recurrence"] == "none"]
-    recurring = [r for r in rows if r["recurrence"] in RECURRING]
+    recurring = [r for r in rows if is_recurring(r["recurrence"])]
     flex = [r for r in rows if r["flexible"]]
     if not timed and not recurring and not flex:
         return "✨ Задач нет. Просто напиши, что и когда напомнить.", None
@@ -997,7 +1020,7 @@ def render_day_readonly(user_id: int, tz: ZoneInfo, d: date, title: str) -> str:
         elif r["recurrence"] == "none":
             if datetime.fromisoformat(r["remind_at"]).date() == d:
                 timed.append((datetime.fromisoformat(r["remind_at"]), r, False))
-        elif r["recurrence"] in RECURRING and _recurs_on(r, d):
+        elif is_recurring(r["recurrence"]) and _recurs_on(r, d):
             timed.append((datetime.fromisoformat(r["remind_at"]), r, True))
 
     if not timed and not flex:
@@ -1030,7 +1053,7 @@ def render_search(user_id: int, tz: ZoneInfo, query: str) -> str:
         dt = datetime.fromisoformat(r["remind_at"])
         if r["recurrence"] == "yearly":
             lines.append(f"🎂 {ru_day_month(dt.date())} — {r['text']}")
-        elif r["recurrence"] in RECURRING:
+        elif is_recurring(r["recurrence"]):
             lines.append(f"🔁 {_repeat_label(r['recurrence'], dt)} в {dt:%H:%M} — {r['text']}")
         elif r["flexible"]:
             lines.append(f"📝 {_day_label(dt.date(), tz)} (без времени) — {r['text']}")

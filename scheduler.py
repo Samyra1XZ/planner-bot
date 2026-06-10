@@ -2,6 +2,7 @@ from datetime import datetime, timedelta, date
 from zoneinfo import ZoneInfo
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
+from apscheduler.triggers.interval import IntervalTrigger
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
 from database import DEFAULT_TZ, get_user_timezone
@@ -17,9 +18,21 @@ scheduler = AsyncIOScheduler(timezone=TZ)
 # Дни рождения: напоминаем за 2 дня (подумать о подарке) и в сам день, в 09:00.
 BIRTHDAY_HOUR = 9
 
-# Типы повторяющихся задач и соответствие дню недели для cron (Пн=0).
-RECURRING = ("daily", "weekdays", "weekly")
+# Дни недели для cron (Пн=0).
 _CRON_WEEKDAYS = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
+
+
+def is_recurring(recurrence: str) -> bool:
+    """
+    Повторяющийся ли тип. Поддерживаем:
+    daily / weekdays / weekly / monthly, 'wd:mon,wed,fri' (свои дни недели),
+    'weeks:2' (раз в N недель).
+    """
+    return (
+        recurrence in ("daily", "weekdays", "weekly", "monthly")
+        or recurrence.startswith("wd:")
+        or recurrence.startswith("weeks:")
+    )
 
 
 def _as_tz(tz):
@@ -80,22 +93,35 @@ def _schedule_yearly(bot, chat_id: int, reminder_id: int, text: str, dt: datetim
 def _schedule_recurring(bot, chat_id: int, reminder_id: int, text: str,
                         dt: datetime, recurrence: str, tz) -> bool:
     """
-    Ставит повторяющееся напоминание через cron в таймзоне tz:
-    daily — каждый день; weekdays — Пн-Пт; weekly — в день недели из dt.
+    Ставит повторяющееся напоминание в таймзоне tz:
+    daily / weekdays (Пн-Пт) / weekly (день недели из dt) / monthly (число из dt) /
+    'wd:mon,wed' (свои дни) — через cron; 'weeks:N' (раз в N недель) — через интервал.
     """
+    args = [bot, chat_id, f"🔁 Сейчас: {text}"]
+
+    # Раз в N недель — интервальный триггер от первой даты dt.
+    if recurrence.startswith("weeks:"):
+        n = int(recurrence.split(":", 1)[1])
+        scheduler.add_job(
+            _send_reminder, trigger=IntervalTrigger(weeks=n, start_date=dt, timezone=tz),
+            args=args, id=str(reminder_id), replace_existing=True,
+        )
+        return True
+
     kwargs = dict(hour=dt.hour, minute=dt.minute, timezone=tz)
     if recurrence == "weekdays":
         kwargs["day_of_week"] = "mon-fri"
     elif recurrence == "weekly":
         kwargs["day_of_week"] = _CRON_WEEKDAYS[dt.weekday()]
-    # daily — без day_of_week (каждый день)
+    elif recurrence == "monthly":
+        kwargs["day"] = dt.day
+    elif recurrence.startswith("wd:"):
+        kwargs["day_of_week"] = recurrence.split(":", 1)[1]   # 'mon,wed,fri'
+    # daily — без доп. полей (каждый день)
 
     scheduler.add_job(
-        _send_reminder,
-        trigger=CronTrigger(**kwargs),
-        args=[bot, chat_id, f"🔁 Сейчас: {text}"],
-        id=str(reminder_id),
-        replace_existing=True,
+        _send_reminder, trigger=CronTrigger(**kwargs),
+        args=args, id=str(reminder_id), replace_existing=True,
     )
     return True
 
@@ -117,7 +143,7 @@ def schedule_reminder(bot, chat_id: int, reminder_id: int, text: str,
     if recurrence == "yearly":
         return _schedule_yearly(bot, chat_id, reminder_id, text, dt, tz)
 
-    if recurrence in RECURRING:
+    if is_recurring(recurrence):
         return _schedule_recurring(bot, chat_id, reminder_id, text, dt, recurrence, tz)
 
     now = datetime.now(tz)
