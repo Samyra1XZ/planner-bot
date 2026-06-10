@@ -194,3 +194,30 @@ def parse_message(text: str, tz=None) -> list:
                 time.sleep(min(2 ** attempt, 4))    # 1, 2, 4 сек
 
     raise last_err
+
+
+def resolve_timezone(place: str):
+    """
+    По названию города/страны/места возвращает IANA-таймзону ('Europe/Moscow')
+    или None, если не понял. Используется в онбординге нового пользователя.
+    """
+    from google.genai import types
+
+    client = _get_client()
+    system = (
+        "Верни IANA-таймзону для указанного города/страны/места. "
+        'Ответ строго JSON: {"tz": "Europe/Moscow"} или {"tz": null} если не понял. '
+        "Никакого текста кроме JSON."
+    )
+    response = client.models.generate_content(
+        model=GEMINI_MODEL,
+        contents=place,
+        config=types.GenerateContentConfig(
+            system_instruction=system,
+            response_mime_type="application/json",
+            temperature=0,
+            thinking_config=types.ThinkingConfig(thinking_budget=0),
+        ),
+    )
+    data = json.loads(_strip_fences(response.text or ""))
+    return data.get("tz")

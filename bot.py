@@ -20,6 +20,7 @@ from database import (
     delete_reminder, get_reminder_by_id, update_reminder_time, count_done_on,
     next_flexible_ord, ensure_user, get_user_timezone,
     get_user, get_all_users, set_user_digest,
+    set_user_timezone, mark_onboarded, is_user_allowed, allow_user, deny_user,
 )
 from scheduler import scheduler, schedule_reminder, reschedule_all, unschedule_reminder, TZ
 from stt import transcribe
@@ -32,11 +33,17 @@ MY_CHAT_ID = int(os.getenv("MY_CHAT_ID"))
 
 
 def is_owner(update: Update) -> bool:
-    """Проверяет, что команду отправил именно я, а не кто-то чужой.
-
-    Пока бот персональный — пускаем только владельца. Когда откроем продукт
-    для всех, эту проверку снимем (схема БД уже многопользовательская)."""
+    """Владелец бота (для админ-команд: выдать/забрать доступ)."""
     return update.effective_user.id == MY_CHAT_ID
+
+
+def _allowed(user_id: int) -> bool:
+    """Есть ли у пользователя доступ: владелец или в белом списке."""
+    return user_id == MY_CHAT_ID or is_user_allowed(user_id)
+
+
+def is_allowed(update: Update) -> bool:
+    return _allowed(update.effective_user.id)
 
 
 def _tz(user_id: int) -> ZoneInfo:
@@ -64,6 +71,48 @@ def build_menu() -> ReplyKeyboardMarkup:
         [[MENU_TODAY, MENU_WEEK], [MENU_BDAY, MENU_LIST], [MENU_ADD]],
         resize_keyboard=True,    # компактные кнопки по размеру текста
         is_persistent=True,      # меню не прячется после нажатия
+    )
+
+
+# Часто используемые таймзоны для онбординга (кнопками, без ввода).
+ONBOARD_TZS = [
+    ("🇷🇺 Москва", "Europe/Moscow"),
+    ("🇺🇦 Киев", "Europe/Kyiv"),
+    ("🇧🇾 Минск", "Europe/Minsk"),
+    ("🇰🇿 Алматы", "Asia/Almaty"),
+    ("🇬🇪 Тбилиси", "Asia/Tbilisi"),
+    ("🇦🇪 Дубай", "Asia/Dubai"),
+    ("🇹🇭 Бангкок", "Asia/Bangkok"),
+    ("🇮🇩 Бали", "Asia/Makassar"),
+]
+
+
+def _tz_keyboard() -> InlineKeyboardMarkup:
+    """Кнопки выбора таймзоны при онбординге (по 2 в ряд)."""
+    rows, row = [], []
+    for label, iana in ONBOARD_TZS:
+        row.append(InlineKeyboardButton(label, callback_data=f"tz:{iana}"))
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    return InlineKeyboardMarkup(rows)
+
+
+def _help_text() -> str:
+    """Подсказка с примерами и командами (показываем после онбординга)."""
+    return (
+        "Готово! ✅ Просто напиши или скажи 🎤 что угодно — я сам пойму:\n"
+        "<i>завтра в 15:00 встреча с клиентом</i>\n"
+        "<i>купить продукты, позвонить в банк</i> (без времени → чек-лист)\n"
+        "<i>каждый будний день в 9 планёрка</i> (повтор)\n"
+        "<i>ДР мамы 20 августа</i>\n"
+        "<i>перенеси зал на 18:00</i> · <i>удали созвон</i>\n\n"
+        "Команды:\n"
+        "/today · /week · /birthdays — списки\n"
+        "/digest 08:00 — утренний дайджест (или /digest off)\n"
+        "/add 15:00 текст · /done 3"
     )
 
 
@@ -463,37 +512,69 @@ async def process_free_text(update: Update, context, raw_text: str):
 # ───────────────────────── Обработчики команд ──────────────────────────
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_owner(update):
+    uid = update.effective_user.id
+
+    # Нет доступа — подсказываем ID, чтобы владелец мог добавить.
+    if not is_allowed(update):
+        await update.message.reply_text(
+            f"🚫 Доступа пока нет. Твой ID: <code>{uid}</code>\n"
+            "Перешли его владельцу бота — он добавит тебя.",
+            parse_mode="HTML",
+        )
         return
 
-    uid = update.effective_user.id
-    ensure_user(uid)                    # заводим пользователя с настройками по умолчанию
-    apply_user_digest(context.bot, uid)  # включаем утренний дайджест (по умолчанию 08:00)
+    ensure_user(uid)
+    u = get_user(uid)
 
-    await update.message.reply_text(
-        "Привет! Я твой личный планер. ⏱ Время — по Бали (UTC+8).\n\n"
-        "Просто напиши или скажи 🎤 что угодно — я сам пойму:\n"
-        "<i>завтра в 15:00 встреча с клиентом</i>\n"
-        "<i>позвонить маме через 2 часа</i>\n"
-        "<i>15.06 в 10:00 оплатить аренду</i>\n"
-        "<i>ДР мамы 20 августа</i>\n"
-        "<i>перенеси зал на 18:00</i>\n"
-        "<i>удали созвон</i>\n\n"
-        "Можно несколько дел в одной фразе — разберу все сразу.\n\n"
-        "Команды:\n"
-        "/today — задачи на сегодня\n"
-        "/week — задачи на 7 дней вперёд\n"
-        "/birthdays — дни рождения\n"
-        "/digest 08:00 — утренний дайджест (или /digest off)\n"
-        "/add 15:00 текст — задача на сегодня\n"
-        "/done 3 — отметить выполненной",
-        parse_mode="HTML",
-        reply_markup=build_menu(),   # показываем нижнее меню
-    )
+    # Первый запуск — спрашиваем таймзону (кнопками или городом).
+    if not u["onboarded"]:
+        context.user_data["awaiting_tz"] = True
+        await update.message.reply_text(
+            "Привет! 👋 Я твой планер.\n\n"
+            "Сначала выбери свой часовой пояс кнопкой ниже — "
+            "или просто напиши свой город, я пойму:",
+            reply_markup=_tz_keyboard(),
+        )
+        return
+
+    apply_user_digest(context.bot, uid)
+    await update.message.reply_text(_help_text(), parse_mode="HTML", reply_markup=build_menu())
+
+
+async def cmd_allow(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Владелец выдаёт доступ: /allow <user_id>."""
+    if not is_owner(update):
+        return
+    if not context.args:
+        await update.message.reply_text("Формат: /allow <user_id>")
+        return
+    try:
+        fid = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("ID должен быть числом.")
+        return
+    allow_user(fid)
+    await update.message.reply_text(f"✅ Доступ выдан: <code>{fid}</code>. Пусть нажмёт /start.", parse_mode="HTML")
+
+
+async def cmd_deny(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Владелец забирает доступ: /deny <user_id>."""
+    if not is_owner(update):
+        return
+    if not context.args:
+        await update.message.reply_text("Формат: /deny <user_id>")
+        return
+    try:
+        fid = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("ID должен быть числом.")
+        return
+    deny_user(fid)
+    await update.message.reply_text(f"🚫 Доступ забран: <code>{fid}</code>.", parse_mode="HTML")
 
 
 async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_owner(update):
+    if not is_allowed(update):
         return
 
     if len(context.args) < 2:
@@ -769,7 +850,7 @@ MENU_RENDERERS = {
 
 
 async def cmd_today(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_owner(update):
+    if not is_allowed(update):
         return
     uid = update.effective_user.id
     text, markup = render_today(uid, _tz(uid))
@@ -777,7 +858,7 @@ async def cmd_today(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_week(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_owner(update):
+    if not is_allowed(update):
         return
     uid = update.effective_user.id
     text, markup = render_week(uid, _tz(uid))
@@ -785,7 +866,7 @@ async def cmd_week(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_owner(update):
+    if not is_allowed(update):
         return
     uid = update.effective_user.id
     text, markup = render_list(uid, _tz(uid))
@@ -793,7 +874,7 @@ async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_birthdays(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_owner(update):
+    if not is_allowed(update):
         return
     uid = update.effective_user.id
     text, markup = render_birthdays(uid, _tz(uid))
@@ -804,7 +885,7 @@ async def on_delete_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Нажата кнопка 🗑: удаляем задачу и перерисовываем тот же список."""
     query = update.callback_query
     uid = update.effective_user.id
-    if uid != MY_CHAT_ID:
+    if not _allowed(uid):
         await query.answer()
         return
 
@@ -823,11 +904,38 @@ async def on_delete_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.edit_message_text(text, parse_mode="HTML", reply_markup=markup)
 
 
+async def _finish_onboarding(update_or_msg, context, uid: int, iana: str, via_message):
+    """Сохраняет таймзону, завершает онбординг, показывает помощь и меню."""
+    set_user_timezone(uid, iana)
+    mark_onboarded(uid)
+    context.user_data.pop("awaiting_tz", None)
+    apply_user_digest(context.bot, uid)
+    await via_message(f"✅ Часовой пояс: <b>{iana}</b>", parse_mode="HTML")
+    await via_message(_help_text(), parse_mode="HTML", reply_markup=build_menu())
+
+
+async def on_tz_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Выбор таймзоны кнопкой при онбординге."""
+    query = update.callback_query
+    uid = update.effective_user.id
+    if not _allowed(uid):
+        await query.answer()
+        return
+    _, iana = query.data.split(":", 1)
+    await query.answer("Готово ✅")
+    await query.edit_message_text("⏳ Сохраняю…")
+
+    async def send(text, **kwargs):
+        await context.bot.send_message(uid, text, **kwargs)
+
+    await _finish_onboarding(update, context, uid, iana, send)
+
+
 async def on_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Нажато «✅ Принять» под превью: выполняем отложенные действия."""
     query = update.callback_query
     uid = update.effective_user.id
-    if uid != MY_CHAT_ID:
+    if not _allowed(uid):
         await query.answer()
         return
 
@@ -853,7 +961,7 @@ async def on_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Нажато «↩️ Отменить» под превью: ничего не сохраняем."""
     query = update.callback_query
     uid = update.effective_user.id
-    if uid != MY_CHAT_ID:
+    if not _allowed(uid):
         await query.answer()
         return
 
@@ -867,7 +975,7 @@ async def on_snooze(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Нажато ⏰ под напоминанием: переносим задачу на +N минут от текущего момента."""
     query = update.callback_query
     uid = update.effective_user.id
-    if uid != MY_CHAT_ID:
+    if not _allowed(uid):
         await query.answer()
         return
 
@@ -894,7 +1002,7 @@ async def on_done_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Нажата кнопка ✅: отмечаем выполненной, показываем счётчик за день, перерисовываем."""
     query = update.callback_query
     uid = update.effective_user.id
-    if uid != MY_CHAT_ID:
+    if not _allowed(uid):
         await query.answer()
         return
 
@@ -923,7 +1031,7 @@ async def on_done_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_digest(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Настройка утреннего дайджеста: /digest 08:00 | /digest off | /digest (статус)."""
-    if not is_owner(update):
+    if not is_allowed(update):
         return
     uid = update.effective_user.id
 
@@ -956,7 +1064,7 @@ async def cmd_digest(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_owner(update):
+    if not is_allowed(update):
         return
 
     if len(context.args) != 1:
@@ -986,12 +1094,36 @@ async def cmd_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ───────────────────────── Свободный текст и голос ──────────────────────────
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Принимает обычный текст. Сначала проверяем кнопки меню, потом — разбор через Gemini."""
-    if not is_owner(update):
+    """Принимает обычный текст. Онбординг → кнопки меню → разбор через Gemini."""
+    uid = update.effective_user.id
+    if not _allowed(uid):
+        await update.message.reply_text(
+            f"🚫 Доступа пока нет. Твой ID: <code>{uid}</code> — перешли его владельцу.",
+            parse_mode="HTML",
+        )
         return
 
     text = update.message.text
-    uid = update.effective_user.id
+
+    # Онбординг: ждём город/таймзону — пробуем распознать через Gemini.
+    if context.user_data.get("awaiting_tz"):
+        try:
+            iana = await asyncio.to_thread(brain.resolve_timezone, text)
+        except Exception:
+            iana = None
+        if iana:
+            try:
+                ZoneInfo(iana)
+            except Exception:
+                iana = None
+        if iana:
+            await _finish_onboarding(update, context, uid, iana, update.message.reply_text)
+        else:
+            await update.message.reply_text(
+                "Не понял город 🤔 Выбери кнопкой ниже или напиши крупный город (например, «Москва»).",
+                reply_markup=_tz_keyboard(),
+            )
+        return
 
     # Нажата кнопка нижнего меню — показываем нужный список, не трогая Gemini.
     if text in MENU_RENDERERS:
@@ -1016,7 +1148,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     Принимает голосовое сообщение:
     скачивает .ogg → распознаёт через stt.transcribe (Groq/Whisper) → отдаёт в Gemini.
     """
-    if not is_owner(update):
+    if not is_allowed(update):
         return
 
     await update.message.reply_text("🎤 Слушаю...")
@@ -1125,6 +1257,12 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("birthdays", cmd_birthdays))
     app.add_handler(CommandHandler("digest", cmd_digest))
     app.add_handler(CommandHandler("done",  cmd_done))
+    # Админ: выдать/забрать доступ
+    app.add_handler(CommandHandler("allow", cmd_allow))
+    app.add_handler(CommandHandler("deny",  cmd_deny))
+
+    # Выбор таймзоны при онбординге
+    app.add_handler(CallbackQueryHandler(on_tz_button, pattern=r"^tz:"))
 
     # Нажатия кнопок: подтверждение разбора, снуз, ✅ выполнено, 🗑 удаление
     app.add_handler(CallbackQueryHandler(on_confirm, pattern=r"^ok:"))

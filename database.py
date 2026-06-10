@@ -61,16 +61,27 @@ def init_db(owner_id: int = None):
             language    TEXT NOT NULL DEFAULT 'ru',
             digest_time TEXT NOT NULL DEFAULT '08:00',
             digest_on   INTEGER NOT NULL DEFAULT 1,
+            onboarded   INTEGER NOT NULL DEFAULT 0,
             created_at  TEXT NOT NULL DEFAULT (datetime('now'))
         )
     """)
 
-    # Миграция users: добавляем настройки утреннего дайджеста, если их ещё нет.
+    # Белый список доступа: кому разрешено пользоваться ботом (владелец всегда).
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS access (
+            user_id  INTEGER PRIMARY KEY,
+            added_at TEXT NOT NULL DEFAULT (datetime('now'))
+        )
+    """)
+
+    # Миграция users: добавляем настройки дайджеста и флаг онбординга, если их ещё нет.
     ucolumns = [row["name"] for row in conn.execute("PRAGMA table_info(users)")]
     if "digest_time" not in ucolumns:
         conn.execute("ALTER TABLE users ADD COLUMN digest_time TEXT NOT NULL DEFAULT '08:00'")
     if "digest_on" not in ucolumns:
         conn.execute("ALTER TABLE users ADD COLUMN digest_on INTEGER NOT NULL DEFAULT 1")
+    if "onboarded" not in ucolumns:
+        conn.execute("ALTER TABLE users ADD COLUMN onboarded INTEGER NOT NULL DEFAULT 0")
 
     # ── Миграции со старых схем ──
     columns = [row["name"] for row in conn.execute("PRAGMA table_info(reminders)")]
@@ -107,9 +118,11 @@ def init_db(owner_id: int = None):
     conn.commit()
     conn.close()
 
-    # Заводим владельцу строку в users с таймзоной по умолчанию (если ещё нет).
+    # Заводим владельцу строку в users и помечаем онбординг пройденным
+    # (его таймзона уже Asia/Makassar — переспрашивать не нужно).
     if owner_id is not None:
         ensure_user(owner_id)
+        mark_onboarded(owner_id)
 
 
 # ───────────────────────── Пользователи ──────────────────────────
@@ -154,6 +167,41 @@ def get_all_users():
     rows = conn.execute("SELECT * FROM users").fetchall()
     conn.close()
     return rows
+
+
+def mark_onboarded(user_id: int):
+    """Помечает, что пользователь прошёл онбординг (выбрал таймзону)."""
+    ensure_user(user_id)
+    conn = get_connection()
+    conn.execute("UPDATE users SET onboarded = 1 WHERE user_id = ?", (user_id,))
+    conn.commit()
+    conn.close()
+
+
+# ───────────────────────── Доступ (белый список) ──────────────────────────
+
+def is_user_allowed(user_id: int) -> bool:
+    """Есть ли пользователь в белом списке доступа."""
+    conn = get_connection()
+    row = conn.execute("SELECT 1 FROM access WHERE user_id = ?", (user_id,)).fetchone()
+    conn.close()
+    return row is not None
+
+
+def allow_user(user_id: int):
+    """Выдаёт доступ пользователю (добавляет в белый список)."""
+    conn = get_connection()
+    conn.execute("INSERT OR IGNORE INTO access (user_id) VALUES (?)", (user_id,))
+    conn.commit()
+    conn.close()
+
+
+def deny_user(user_id: int):
+    """Забирает доступ у пользователя."""
+    conn = get_connection()
+    conn.execute("DELETE FROM access WHERE user_id = ?", (user_id,))
+    conn.commit()
+    conn.close()
 
 
 def set_user_digest(user_id: int, digest_time: str = None, digest_on: int = None):
