@@ -119,6 +119,9 @@ def init_db(owner_id: int = None):
         conn.execute("ALTER TABLE reminders ADD COLUMN flexible INTEGER NOT NULL DEFAULT 0")
     if "ord" not in columns:
         conn.execute("ALTER TABLE reminders ADD COLUMN ord INTEGER NOT NULL DEFAULT 0")
+    # Дата создания (для статистики «создано за месяц»). Старые строки — NULL.
+    if "created_at" not in columns:
+        conn.execute("ALTER TABLE reminders ADD COLUMN created_at TEXT")
 
     # Любые осиротевшие задачи (user_id IS NULL) отдаём владельцу, чтобы не потерять.
     if owner_id is not None:
@@ -257,8 +260,8 @@ def add_reminder(user_id: int, text: str, remind_at: str, recurrence: str = "non
     """
     conn = get_connection()
     cursor = conn.execute(
-        "INSERT INTO reminders (user_id, text, remind_at, recurrence, flexible, ord) "
-        "VALUES (?, ?, ?, ?, ?, ?)",
+        "INSERT INTO reminders (user_id, text, remind_at, recurrence, flexible, ord, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, datetime('now'))",
         (user_id, text, remind_at, recurrence, flexible, ord),
     )
     conn.commit()
@@ -357,6 +360,33 @@ def get_completed_on(user_id: int, day_iso: str):
     ).fetchall()
     conn.close()
     return [row["text"] for row in once] + [row["text"] for row in inst]
+
+
+def count_created_in_month(user_id: int, ym: str) -> int:
+    """Сколько задач создано за месяц (ym = 'YYYY-MM')."""
+    conn = get_connection()
+    row = conn.execute(
+        "SELECT COUNT(*) AS c FROM reminders WHERE user_id = ? AND created_at LIKE ?",
+        (user_id, ym + "%"),
+    ).fetchone()
+    conn.close()
+    return row["c"]
+
+
+def completed_days_in_month(user_id: int, ym: str):
+    """Дни всех закрытий за месяц (с повторами) — для счёта и лучшего дня."""
+    conn = get_connection()
+    once = conn.execute(
+        "SELECT substr(done_at, 1, 10) AS d FROM reminders "
+        "WHERE user_id = ? AND done = 1 AND done_at LIKE ?",
+        (user_id, ym + "%"),
+    ).fetchall()
+    inst = conn.execute(
+        "SELECT day AS d FROM done_instances WHERE user_id = ? AND day LIKE ?",
+        (user_id, ym + "%"),
+    ).fetchall()
+    conn.close()
+    return [r["d"] for r in once] + [r["d"] for r in inst]
 
 
 def mark_instance_done(user_id: int, reminder_id: int, day: str):

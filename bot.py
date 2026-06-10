@@ -3,6 +3,7 @@ import os
 import re
 import secrets
 import tempfile
+from collections import Counter
 from datetime import datetime, timedelta, date
 from zoneinfo import ZoneInfo
 
@@ -19,6 +20,7 @@ from database import (
     init_db, add_reminder, get_active_reminders, get_all_active_reminders, mark_done,
     delete_reminder, get_reminder_by_id, update_reminder_time, count_done_on,
     mark_instance_done, is_instance_done, count_instances_done_on, get_completed_on,
+    count_created_in_month, completed_days_in_month,
     next_flexible_ord, update_reminder_ord, ensure_user, get_user_timezone,
     get_user, get_all_users, set_user_digest, set_user_evening,
     set_user_timezone, mark_onboarded, is_user_allowed, allow_user, deny_user,
@@ -89,13 +91,19 @@ MENU_WEEK = "🗓 Неделя"
 MENU_UPCOMING = "📆 Впереди"
 MENU_BDAY = "🎂 Дни рождения"
 MENU_LIST = "📝 Все задачи"
+MENU_STATS = "📊 Статистика"
 MENU_ADD = "➕ Новая задача"
 
 
 def build_menu() -> ReplyKeyboardMarkup:
-    """Постоянное меню внизу экрана — навигация тапами, без ввода команд."""
+    """Постоянное нижнее меню — минимализм: списки, статистика, добавление."""
     return ReplyKeyboardMarkup(
-        [[MENU_TODAY, MENU_WEEK], [MENU_UPCOMING, MENU_BDAY], [MENU_LIST, MENU_ADD]],
+        [
+            [MENU_TODAY, MENU_WEEK],
+            [MENU_UPCOMING, MENU_LIST],
+            [MENU_BDAY, MENU_STATS],
+            [MENU_ADD],
+        ],
         resize_keyboard=True,    # компактные кнопки по размеру текста
         is_persistent=True,      # меню не прячется после нажатия
     )
@@ -140,8 +148,8 @@ def _help_text() -> str:
         "А ещё можно спрашивать: <i>что у меня завтра?</i>, <i>когда я к врачу?</i>\n\n"
         "Команды:\n"
         "/today · /week · /upcoming · /birthdays — списки\n"
-        "/done — что сделано сегодня · /digest 08:00 · /evening 21:00\n"
-        "/timezone · /help"
+        "/stats — статистика по месяцам · /done — что сделано сегодня\n"
+        "/digest 08:00 · /evening 21:00 · /timezone · /help"
     )
 
 
@@ -1116,6 +1124,31 @@ def render_search(user_id: int, tz: ZoneInfo, query: str) -> str:
     return "\n".join(lines)
 
 
+def render_stats(user_id: int, year: int, month: int):
+    """Минималистичная статистика за месяц + кнопки переключения месяцев."""
+    ym = f"{year:04d}-{month:02d}"
+    days = completed_days_in_month(user_id, ym)
+    created = count_created_in_month(user_id, ym)
+
+    lines = [
+        f"📊 <b>{RU_MONTHS_NOM[month - 1]} {year}</b>",
+        "",
+        f"✅ Выполнено: <b>{len(days)}</b>",
+        f"📝 Создано: <b>{created}</b>",
+    ]
+    if days:
+        day, n = Counter(days).most_common(1)[0]
+        lines.append(f"🔥 Лучший день: {ru_day_month(date.fromisoformat(day))} — {n}")
+
+    prev_y, prev_m = (year, month - 1) if month > 1 else (year - 1, 12)
+    next_y, next_m = (year, month + 1) if month < 12 else (year + 1, 1)
+    nav = InlineKeyboardMarkup([[
+        InlineKeyboardButton(f"◀ {RU_MONTHS_NOM[prev_m - 1]}", callback_data=f"stat:{prev_y}-{prev_m:02d}"),
+        InlineKeyboardButton(f"{RU_MONTHS_NOM[next_m - 1]} ▶", callback_data=f"stat:{next_y}-{next_m:02d}"),
+    ]])
+    return "\n".join(lines), nav
+
+
 # Сопоставление имени вида с его рендером — нужно при перерисовке после удаления.
 RENDERERS = {
     "today": render_today, "week": render_week,
@@ -1169,6 +1202,29 @@ async def cmd_upcoming(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     text, markup = render_upcoming(uid, _tz(uid))
     await update.message.reply_text(text, parse_mode="HTML", reply_markup=markup)
+
+
+async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update):
+        return
+    uid = update.effective_user.id
+    now = datetime.now(_tz(uid))
+    text, markup = render_stats(uid, now.year, now.month)
+    await update.message.reply_text(text, parse_mode="HTML", reply_markup=markup)
+
+
+async def on_stat(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Переключение месяца в статистике."""
+    query = update.callback_query
+    uid = update.effective_user.id
+    if not _allowed(uid):
+        await query.answer()
+        return
+    _, ym = query.data.split(":", 1)
+    year, month = ym.split("-")
+    await query.answer()
+    text, markup = render_stats(uid, int(year), int(month))
+    await query.edit_message_text(text, parse_mode="HTML", reply_markup=markup)
 
 
 async def on_delete_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1524,6 +1580,13 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         return
 
+    # Кнопка «Статистика» — отдельно (своя сигнатура с месяцем).
+    if text == MENU_STATS:
+        now = datetime.now(_tz(uid))
+        out, markup = render_stats(uid, now.year, now.month)
+        await update.message.reply_text(out, parse_mode="HTML", reply_markup=markup)
+        return
+
     # Нажата кнопка нижнего меню — показываем нужный список, не трогая Gemini.
     if text in MENU_RENDERERS:
         render = MENU_RENDERERS[text]
@@ -1694,6 +1757,7 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("upcoming", cmd_upcoming))
     app.add_handler(CommandHandler("list",  cmd_list))
     app.add_handler(CommandHandler("birthdays", cmd_birthdays))
+    app.add_handler(CommandHandler("stats", cmd_stats))
     app.add_handler(CommandHandler("digest", cmd_digest))
     app.add_handler(CommandHandler("evening", cmd_evening))
     app.add_handler(CommandHandler("timezone", cmd_timezone))
@@ -1705,6 +1769,8 @@ if __name__ == "__main__":
 
     # Выбор таймзоны при онбординге
     app.add_handler(CallbackQueryHandler(on_tz_button, pattern=r"^tz:"))
+    # Переключение месяца в статистике
+    app.add_handler(CallbackQueryHandler(on_stat, pattern=r"^stat:"))
 
     # Нажатия кнопок: подтверждение разбора, снуз, ✅ выполнено, 🗑 удаление
     app.add_handler(CallbackQueryHandler(on_confirm, pattern=r"^ok:"))
