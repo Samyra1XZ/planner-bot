@@ -5,7 +5,7 @@ from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
-from database import DEFAULT_TZ, get_user_timezone
+from database import DEFAULT_TZ, get_user_timezone, is_instance_done
 
 # Таймзона по умолчанию (Бали, UTC+8) — фолбэк, если у пользователя своя не задана.
 # Теперь время считаем в ЛИЧНОЙ таймзоне пользователя, но дефолт держим здесь.
@@ -65,6 +65,14 @@ async def _send_reminder(bot, chat_id: int, text: str,
     await bot.send_message(chat_id=chat_id, text=text, reply_markup=markup)
 
 
+async def _send_recurring(bot, chat_id: int, reminder_id: int, text: str, tz_key: str):
+    # Повторяющееся напоминание: не шлём, если задача уже отмечена выполненной на сегодня.
+    day = datetime.now(ZoneInfo(tz_key)).date().isoformat()
+    if is_instance_done(reminder_id, day):
+        return
+    await bot.send_message(chat_id=chat_id, text=f"🔁 Сейчас: {text}")
+
+
 def _schedule_yearly(bot, chat_id: int, reminder_id: int, text: str, dt: datetime, tz) -> bool:
     """
     Ставит ежегодные напоминания о дне рождения через cron (год игнорируется,
@@ -97,13 +105,14 @@ def _schedule_recurring(bot, chat_id: int, reminder_id: int, text: str,
     daily / weekdays (Пн-Пт) / weekly (день недели из dt) / monthly (число из dt) /
     'wd:mon,wed' (свои дни) — через cron; 'weeks:N' (раз в N недель) — через интервал.
     """
-    args = [bot, chat_id, f"🔁 Сейчас: {text}"]
+    # Повтор шлём через _send_recurring — он пропустит отмеченные «выполнено на сегодня».
+    args = [bot, chat_id, reminder_id, text, str(tz)]
 
     # Раз в N недель — интервальный триггер от первой даты dt.
     if recurrence.startswith("weeks:"):
         n = int(recurrence.split(":", 1)[1])
         scheduler.add_job(
-            _send_reminder, trigger=IntervalTrigger(weeks=n, start_date=dt, timezone=tz),
+            _send_recurring, trigger=IntervalTrigger(weeks=n, start_date=dt, timezone=tz),
             args=args, id=str(reminder_id), replace_existing=True,
         )
         return True
@@ -120,7 +129,7 @@ def _schedule_recurring(bot, chat_id: int, reminder_id: int, text: str,
     # daily — без доп. полей (каждый день)
 
     scheduler.add_job(
-        _send_reminder, trigger=CronTrigger(**kwargs),
+        _send_recurring, trigger=CronTrigger(**kwargs),
         args=args, id=str(reminder_id), replace_existing=True,
     )
     return True

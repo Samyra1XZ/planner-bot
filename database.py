@@ -74,6 +74,16 @@ def init_db(owner_id: int = None):
         )
     """)
 
+    # Выполненные «на сегодня» экземпляры повторяющихся задач (повтор не закрывается весь).
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS done_instances (
+            reminder_id INTEGER NOT NULL,
+            user_id     INTEGER NOT NULL,
+            day         TEXT    NOT NULL,
+            PRIMARY KEY (reminder_id, day)
+        )
+    """)
+
     # Миграция users: добавляем настройки дайджеста и флаг онбординга, если их ещё нет.
     ucolumns = [row["name"] for row in conn.execute("PRAGMA table_info(users)")]
     if "digest_time" not in ucolumns:
@@ -313,6 +323,39 @@ def count_done_on(user_id: int, day_iso: str) -> int:
     return row["c"]
 
 
+def mark_instance_done(user_id: int, reminder_id: int, day: str):
+    """Отмечает повторяющуюся задачу выполненной НА ДЕНЬ day ('YYYY-MM-DD')."""
+    conn = get_connection()
+    conn.execute(
+        "INSERT OR IGNORE INTO done_instances (reminder_id, user_id, day) VALUES (?, ?, ?)",
+        (reminder_id, user_id, day),
+    )
+    conn.commit()
+    conn.close()
+
+
+def is_instance_done(reminder_id: int, day: str) -> bool:
+    """Отмечена ли повторяющаяся задача выполненной на указанный день."""
+    conn = get_connection()
+    row = conn.execute(
+        "SELECT 1 FROM done_instances WHERE reminder_id = ? AND day = ?",
+        (reminder_id, day),
+    ).fetchone()
+    conn.close()
+    return row is not None
+
+
+def count_instances_done_on(user_id: int, day: str) -> int:
+    """Сколько повторов закрыто «на сегодня» в указанный день."""
+    conn = get_connection()
+    row = conn.execute(
+        "SELECT COUNT(*) AS c FROM done_instances WHERE user_id = ? AND day = ?",
+        (user_id, day),
+    ).fetchone()
+    conn.close()
+    return row["c"]
+
+
 def delete_reminder(user_id: int, reminder_id: int) -> bool:
     """Полностью удаляет напоминание пользователя. True, если строка нашлась."""
     conn = get_connection()
@@ -320,6 +363,7 @@ def delete_reminder(user_id: int, reminder_id: int) -> bool:
         "DELETE FROM reminders WHERE id = ? AND user_id = ?",
         (reminder_id, user_id),
     )
+    conn.execute("DELETE FROM done_instances WHERE reminder_id = ?", (reminder_id,))
     conn.commit()
     deleted = cursor.rowcount > 0
     conn.close()

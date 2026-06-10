@@ -18,6 +18,7 @@ from apscheduler.triggers.cron import CronTrigger
 from database import (
     init_db, add_reminder, get_active_reminders, get_all_active_reminders, mark_done,
     delete_reminder, get_reminder_by_id, update_reminder_time, count_done_on,
+    mark_instance_done, is_instance_done, count_instances_done_on,
     next_flexible_ord, update_reminder_ord, ensure_user, get_user_timezone,
     get_user, get_all_users, set_user_digest,
     set_user_timezone, mark_onboarded, is_user_allowed, allow_user, deny_user,
@@ -838,7 +839,8 @@ def render_today(user_id: int, tz: ZoneInfo):
         elif r["recurrence"] == "none":
             if datetime.fromisoformat(r["remind_at"]).date() == today:
                 timed.append((datetime.fromisoformat(r["remind_at"]), r, False))
-        elif is_recurring(r["recurrence"]) and _recurs_on(r, today):
+        elif (is_recurring(r["recurrence"]) and _recurs_on(r, today)
+              and not is_instance_done(r["id"], today.isoformat())):
             timed.append((datetime.fromisoformat(r["remind_at"]), r, True))
 
     if not timed and not flex:
@@ -852,7 +854,8 @@ def render_today(user_id: int, tz: ZoneInfo):
             mark = "🔁" if is_rec else "🕐"
             block.append(f"{mark} <code>{dt:%H:%M}</code> {pick_emoji(r['text'])} {r['text']}")
             if is_rec:
-                items.append(("today", r["id"], r["text"], False))  # повтор — только 🗑
+                # повтор: ✅ закрывает только на сегодня, серия продолжается
+                items.append(("today", r["id"], r["text"], True))
             else:
                 items.append(("today", r["id"], f"{dt:%H:%M} {r['text']}"))
         parts.append("\n".join(block))
@@ -885,7 +888,8 @@ def render_week(user_id: int, tz: ZoneInfo):
             elif r["recurrence"] == "none":
                 if datetime.fromisoformat(r["remind_at"]).date() == d:
                     day_timed.append((datetime.fromisoformat(r["remind_at"]), r, False))
-            elif is_recurring(r["recurrence"]) and _recurs_on(r, d):
+            elif (is_recurring(r["recurrence"]) and _recurs_on(r, d)
+                  and not is_instance_done(r["id"], d.isoformat())):
                 day_timed.append((datetime.fromisoformat(r["remind_at"]), r, True))
 
         if not day_timed and not day_flex:
@@ -1020,7 +1024,8 @@ def render_day_readonly(user_id: int, tz: ZoneInfo, d: date, title: str) -> str:
         elif r["recurrence"] == "none":
             if datetime.fromisoformat(r["remind_at"]).date() == d:
                 timed.append((datetime.fromisoformat(r["remind_at"]), r, False))
-        elif is_recurring(r["recurrence"]) and _recurs_on(r, d):
+        elif (is_recurring(r["recurrence"]) and _recurs_on(r, d)
+              and not is_instance_done(r["id"], d.isoformat())):
             timed.append((datetime.fromisoformat(r["remind_at"]), r, True))
 
     if not timed and not flex:
@@ -1234,6 +1239,11 @@ async def on_snooze(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.edit_message_text(f"⏰ Отложено до {new_dt:%H:%M}: {r['text']}")
 
 
+def _done_today_count(user_id: int, day_iso: str) -> int:
+    """Закрыто за день: разовые задачи + отмеченные «на сегодня» повторы."""
+    return count_done_on(user_id, day_iso) + count_instances_done_on(user_id, day_iso)
+
+
 async def on_move(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Нажата ⬆️/⬇️: меняет позицию пункта чек-листа и перерисовывает список."""
     query = update.callback_query
@@ -1280,10 +1290,17 @@ async def on_done_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tz = _tz(uid)
     now = datetime.now(tz)
 
-    ok = mark_done(uid, rid, now.strftime("%Y-%m-%d %H:%M"))
-    unschedule_reminder(rid)  # снимаем запланированные напоминания закрытой задачи
+    day = now.date().isoformat()
+    r = get_reminder_by_id(uid, rid)
+    if r and is_recurring(r["recurrence"]):
+        # Повтор: закрываем только на сегодня — серия продолжается, джоб не снимаем.
+        mark_instance_done(uid, rid, day)
+        ok = True
+    else:
+        ok = mark_done(uid, rid, now.strftime("%Y-%m-%d %H:%M"))
+        unschedule_reminder(rid)  # снимаем напоминания закрытой разовой задачи
 
-    done_today = count_done_on(uid, now.date().isoformat()) if ok else None
+    done_today = _done_today_count(uid, day) if ok else None
     await query.answer(f"Готово ✅  ({done_today} за сегодня)" if ok else "Уже закрыто")
 
     # Нажато прямо из напоминания (не из списка) — просто отмечаем сообщение.
@@ -1350,7 +1367,7 @@ async def cmd_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
     now = datetime.now(_tz(uid))
     success = mark_done(uid, reminder_id, now.strftime("%Y-%m-%d %H:%M"))
     if success:
-        done_today = count_done_on(uid, now.date().isoformat())
+        done_today = _done_today_count(uid, now.date().isoformat())
         await update.message.reply_text(
             f"✅ Напоминание #{reminder_id} выполнено!  ({done_today} за сегодня)"
         )
