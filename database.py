@@ -239,6 +239,17 @@ def add_reminder(user_id: int, text: str, remind_at: str, recurrence: str = "non
     return new_id
 
 
+def update_reminder_ord(user_id: int, reminder_id: int, ord: int):
+    """Меняет позицию (ord) задачи без времени — для перестановки чек-листа."""
+    conn = get_connection()
+    conn.execute(
+        "UPDATE reminders SET ord = ? WHERE id = ? AND user_id = ?",
+        (ord, reminder_id, user_id),
+    )
+    conn.commit()
+    conn.close()
+
+
 def next_flexible_ord(user_id: int, day_iso: str) -> int:
     """Следующий порядковый номер для задачи без времени на указанный день."""
     conn = get_connection()

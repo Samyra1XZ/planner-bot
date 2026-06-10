@@ -18,7 +18,7 @@ from apscheduler.triggers.cron import CronTrigger
 from database import (
     init_db, add_reminder, get_active_reminders, get_all_active_reminders, mark_done,
     delete_reminder, get_reminder_by_id, update_reminder_time, count_done_on,
-    next_flexible_ord, ensure_user, get_user_timezone,
+    next_flexible_ord, update_reminder_ord, ensure_user, get_user_timezone,
     get_user, get_all_users, set_user_digest,
     set_user_timezone, mark_onboarded, is_user_allowed, allow_user, deny_user,
 )
@@ -647,9 +647,10 @@ def _short(s: str, n: int = 25) -> str:
 
 def _item_keyboard(items, with_done: bool = True):
     """
-    items — список (view, id, подпись) или (view, id, подпись, done_ok).
-    На каждую задачу строка: «✅ выполнено» + 🗑. done_ok=False (или with_done=False) —
-    только 🗑 (для ДР, повторяющихся задач и выбора при удалении).
+    items — кортежи (view, id, подпись[, done_ok[, reorder]]).
+    done_ok — показывать ли «✅ выполнено» (иначе только 🗑).
+    reorder=True — пункт чек-листа: компактный ряд иконок ⬆️ ⬇️ ✅ 🗑
+    (подпись берётся из самого сообщения по номеру строки).
     """
     if not items:
         return None
@@ -657,7 +658,17 @@ def _item_keyboard(items, with_done: bool = True):
     for item in items:
         view, rid, label = item[0], item[1], item[2]
         done_ok = item[3] if len(item) > 3 else with_done
-        if done_ok:
+        reorder = item[4] if len(item) > 4 else False
+        if reorder:
+            row = [
+                InlineKeyboardButton("⬆️", callback_data=f"mv:up:{view}:{rid}"),
+                InlineKeyboardButton("⬇️", callback_data=f"mv:dn:{view}:{rid}"),
+            ]
+            if done_ok:
+                row.append(InlineKeyboardButton("✅", callback_data=f"done:{view}:{rid}"))
+            row.append(InlineKeyboardButton("🗑", callback_data=f"del:{view}:{rid}"))
+            rows.append(row)
+        elif done_ok:
             rows.append([
                 InlineKeyboardButton(f"✅ {_short(label)}", callback_data=f"done:{view}:{rid}"),
                 InlineKeyboardButton("🗑", callback_data=f"del:{view}:{rid}"),
@@ -716,10 +727,11 @@ def render_today(user_id: int, tz: ZoneInfo):
         parts.append("\n".join(block))
     if flex:
         flex.sort(key=lambda r: r["ord"])
+        can_reorder = len(flex) > 1            # ⬆️⬇️ нужны только при 2+ пунктах
         block = ["📝 <b>Без времени:</b>"]
         for i, r in enumerate(flex, 1):
             block.append(f"{i}. {pick_emoji(r['text'])} {r['text']}")
-            items.append(("today", r["id"], r["text"]))
+            items.append(("today", r["id"], r["text"], True, can_reorder))
         parts.append("\n".join(block))
 
     body = "\n\n".join(parts)
@@ -998,6 +1010,39 @@ async def on_snooze(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.edit_message_text(f"⏰ Отложено до {new_dt:%H:%M}: {r['text']}")
 
 
+async def on_move(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Нажата ⬆️/⬇️: меняет позицию пункта чек-листа и перерисовывает список."""
+    query = update.callback_query
+    uid = update.effective_user.id
+    if not _allowed(uid):
+        await query.answer()
+        return
+
+    _, direction, view, rid = query.data.split(":")
+    rid = int(rid)
+    tz = _tz(uid)
+
+    r = get_reminder_by_id(uid, rid)
+    if r and r["flexible"]:
+        # Соседи — задачи без времени того же дня, по текущему порядку.
+        sibs = [x for x in get_active_reminders(uid)
+                if x["flexible"] and x["remind_at"] == r["remind_at"]]
+        sibs.sort(key=lambda x: x["ord"])
+        ids = [x["id"] for x in sibs]
+        if rid in ids:
+            i = ids.index(rid)
+            j = i - 1 if direction == "up" else i + 1
+            if 0 <= j < len(sibs):
+                sibs[i], sibs[j] = sibs[j], sibs[i]      # меняем местами
+                for pos, x in enumerate(sibs):           # перенумеровываем 0..n-1
+                    update_reminder_ord(uid, x["id"], pos)
+
+    await query.answer()
+    render = RENDERERS.get(view, render_today)
+    text, markup = render(uid, tz)
+    await query.edit_message_text(text, parse_mode="HTML", reply_markup=markup)
+
+
 async def on_done_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Нажата кнопка ✅: отмечаем выполненной, показываем счётчик за день, перерисовываем."""
     query = update.callback_query
@@ -1268,6 +1313,7 @@ if __name__ == "__main__":
     app.add_handler(CallbackQueryHandler(on_confirm, pattern=r"^ok:"))
     app.add_handler(CallbackQueryHandler(on_cancel, pattern=r"^no:"))
     app.add_handler(CallbackQueryHandler(on_snooze, pattern=r"^snooze:"))
+    app.add_handler(CallbackQueryHandler(on_move, pattern=r"^mv:"))
     app.add_handler(CallbackQueryHandler(on_done_button, pattern=r"^done:"))
     app.add_handler(CallbackQueryHandler(on_delete_button, pattern=r"^del:"))
 
