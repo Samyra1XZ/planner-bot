@@ -199,25 +199,33 @@ def parse_message(text: str, tz=None) -> list:
 def resolve_timezone(place: str):
     """
     По названию города/страны/места возвращает IANA-таймзону ('Europe/Moscow')
-    или None, если не понял. Используется в онбординге нового пользователя.
+    или None, если не понял / сервис недоступен. Используется в онбординге;
+    при None бот предлагает выбрать таймзону кнопками.
+    Устойчиво к 429/503: пробует основную модель, затем запасную.
     """
     from google.genai import types
 
-    client = _get_client()
     system = (
         "Верни IANA-таймзону для указанного города/страны/места. "
         'Ответ строго JSON: {"tz": "Europe/Moscow"} или {"tz": null} если не понял. '
         "Никакого текста кроме JSON."
     )
-    response = client.models.generate_content(
-        model=GEMINI_MODEL,
-        contents=place,
-        config=types.GenerateContentConfig(
-            system_instruction=system,
-            response_mime_type="application/json",
-            temperature=0,
-            thinking_config=types.ThinkingConfig(thinking_budget=0),
-        ),
-    )
-    data = json.loads(_strip_fences(response.text or ""))
-    return data.get("tz")
+    client = _get_client()
+    for model in _MODELS:
+        try:
+            cfg = dict(
+                system_instruction=system,
+                response_mime_type="application/json",
+                temperature=0,
+            )
+            if model.startswith("gemini-2.5"):
+                cfg["thinking_config"] = types.ThinkingConfig(thinking_budget=0)
+            response = client.models.generate_content(
+                model=model, contents=place,
+                config=types.GenerateContentConfig(**cfg),
+            )
+            data = json.loads(_strip_fences(response.text or ""))
+            return data.get("tz")
+        except Exception as e:
+            print(f"[brain.tz] {model}: {e!r}")
+    return None  # не смогли — онбординг предложит кнопки
