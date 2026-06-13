@@ -1,0 +1,415 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>English B1→B2 · Daniil & Olya</title>
+<style>
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+:root{
+  --bg:#090d18;
+  --s1:#101728;
+  --s2:#16203a;
+  --bdr:#1d2d4a;
+  --bdr2:#263550;
+  --ac:#00c9ff;
+  --ac-dim:rgba(0,201,255,.11);
+  --ac-glow:rgba(0,201,255,.22);
+  --green:#00e676;
+  --green-dim:rgba(0,230,118,.09);
+  --green-bdr:rgba(0,230,118,.22);
+  --fire:#ff6b35;
+  --text:#dde5f4;
+  --muted:#5a6e94;
+  --dim:#253047;
+  --r:10px;
+  --rsm:6px;
+  --f:system-ui,-apple-system,'Segoe UI',Helvetica,sans-serif;
+}
+html{font-size:16px;scroll-behavior:smooth}
+body{
+  background:var(--bg);color:var(--text);
+  font-family:var(--f);min-height:100vh;
+  padding:32px 18px 88px;
+}
+
+/* ──────── HEADER ──────── */
+.hdr{max-width:1000px;margin:0 auto 48px}
+.hdr-top{
+  display:flex;align-items:center;justify-content:space-between;
+  gap:14px;flex-wrap:wrap;margin-bottom:24px;
+}
+.logo{font-size:1.35rem;font-weight:800;letter-spacing:-.03em;line-height:1}
+.logo em{color:var(--ac);font-style:normal}
+.logo small{display:block;font-size:.65rem;font-weight:400;color:var(--muted);letter-spacing:.04em;margin-top:3px}
+
+.stats{display:flex;align-items:center;gap:20px;flex-wrap:wrap}
+.stat{text-align:center}
+.sv{
+  display:block;font-size:1.6rem;font-weight:900;line-height:1;
+  color:var(--ac);font-variant-numeric:tabular-nums;
+}
+.sl{
+  display:block;font-size:.6rem;text-transform:uppercase;
+  letter-spacing:.09em;color:var(--muted);margin-top:3px;
+}
+.stat.fire .sv{color:var(--fire)}
+
+.btn-rst{
+  background:none;border:1px solid var(--dim);color:var(--muted);
+  border-radius:var(--rsm);padding:6px 14px;
+  font:.74rem var(--f);cursor:pointer;transition:.2s;
+  display:flex;align-items:center;gap:5px;
+}
+.btn-rst:hover{border-color:#e05;color:#e05;background:rgba(220,0,80,.07)}
+
+/* PROGRESS BAR */
+.bar-wrap{
+  background:var(--s1);border:1px solid var(--bdr);
+  border-radius:99px;height:9px;overflow:hidden;position:relative;
+}
+.bar{
+  height:100%;border-radius:99px;
+  background:linear-gradient(90deg,#00c9ff 0%,#00e5aa 100%);
+  transition:width .6s cubic-bezier(.4,0,.2,1);
+  box-shadow:0 0 12px var(--ac-glow);
+  min-width:0;
+}
+.bar-foot{
+  display:flex;justify-content:space-between;
+  font-size:.68rem;color:var(--muted);margin-top:6px;
+}
+
+/* ──────── WEEK SECTION ──────── */
+.week{max-width:1000px;margin:0 auto 30px}
+.whdr{
+  display:flex;align-items:baseline;gap:10px;margin-bottom:11px;
+  padding-bottom:8px;border-bottom:1px solid var(--bdr);
+}
+.wnum{
+  font-size:.62rem;font-weight:700;text-transform:uppercase;
+  letter-spacing:.11em;color:var(--muted);white-space:nowrap;
+}
+.wtopic{font-size:.83rem;font-weight:600;color:var(--ac)}
+.wprog{
+  margin-left:auto;font-size:.65rem;color:var(--muted);
+  white-space:nowrap;font-variant-numeric:tabular-nums;
+}
+.wgrid{
+  display:grid;grid-template-columns:repeat(5,1fr);gap:10px;
+}
+@media(max-width:700px){
+  .wgrid{grid-template-columns:repeat(2,1fr)}
+  .wgrid .dc:last-child{grid-column:1/-1}
+}
+
+/* ──────── DAY CARD ──────── */
+.dc{
+  background:var(--s1);border:1px solid var(--bdr);
+  border-radius:var(--r);padding:12px 12px 10px;
+  position:relative;transition:border-color .2s,background .2s;
+}
+.dc:hover{border-color:var(--bdr2)}
+.dc.done{
+  background:var(--green-dim);border-color:var(--green-bdr);
+}
+.dc.done::after{
+  content:'✓';position:absolute;top:9px;right:11px;
+  font-size:.78rem;font-weight:700;color:var(--green);
+}
+.dname{
+  font-size:.6rem;font-weight:700;text-transform:uppercase;
+  letter-spacing:.13em;color:var(--muted);margin-bottom:11px;
+}
+.dc.done .dname{color:var(--green)}
+
+/* TASK LIST */
+.tlist{list-style:none;display:flex;flex-direction:column;gap:8px;margin-bottom:10px}
+.ti{display:flex;align-items:flex-start;gap:7px;cursor:pointer}
+.ti input[type=checkbox]{
+  appearance:none;-webkit-appearance:none;
+  width:15px;height:15px;min-width:15px;
+  border:1.5px solid var(--dim);border-radius:4px;
+  background:var(--s2);cursor:pointer;
+  position:relative;transition:.15s;margin-top:1px;flex-shrink:0;
+}
+.ti input:checked{background:var(--ac);border-color:var(--ac)}
+.ti input:checked::after{
+  content:'';position:absolute;
+  left:3px;top:0px;width:5px;height:9px;
+  border:2px solid #001824;
+  border-top:none;border-left:none;
+  transform:rotate(45deg);
+}
+.ti input:focus-visible{outline:2px solid var(--ac);outline-offset:2px}
+.tlabel{
+  font-size:.75rem;color:var(--text);
+  line-height:1.45;user-select:none;
+}
+.ti input:checked~.tlabel{
+  color:var(--muted);
+  text-decoration:line-through;
+  text-decoration-color:var(--dim);
+}
+
+/* PHRASES TOGGLE */
+.ptog{
+  background:none;border:1px solid var(--dim);border-radius:var(--rsm);
+  color:var(--muted);font:.7rem var(--f);
+  padding:4px 9px;cursor:pointer;
+  width:100%;text-align:left;transition:.2s;
+  display:flex;align-items:center;gap:5px;
+}
+.ptog:hover,.ptog.open{
+  border-color:var(--ac);color:var(--ac);background:var(--ac-dim);
+}
+.pa{display:none;margin-top:7px}
+.pa.open{display:block}
+.pta{
+  width:100%;background:var(--bg);
+  border:1px solid var(--bdr);border-radius:var(--rsm);
+  color:var(--text);font:.74rem/1.55 var(--f);
+  padding:8px;resize:vertical;min-height:84px;
+  outline:none;transition:border-color .2s;
+}
+.pta:focus{border-color:var(--ac)}
+.pta::placeholder{color:var(--dim)}
+
+/* SCROLLBAR */
+::-webkit-scrollbar{width:5px}
+::-webkit-scrollbar-track{background:var(--bg)}
+::-webkit-scrollbar-thumb{background:var(--bdr2);border-radius:3px}
+
+/* FOOTER */
+.foot{
+  text-align:center;color:var(--dim);
+  font-size:.66rem;margin-top:48px;letter-spacing:.04em;
+}
+</style>
+</head>
+<body>
+
+<div class="hdr">
+  <div class="hdr-top">
+    <div class="logo">
+      English <em>B1→B2</em>
+      <small>Daniil &amp; Olya · The Mentalist · 8 weeks</small>
+    </div>
+    <div class="stats">
+      <div class="stat fire">
+        <span class="sv" id="st-cur">0</span>
+        <span class="sl">Streak 🔥</span>
+      </div>
+      <div class="stat">
+        <span class="sv" id="st-best">0</span>
+        <span class="sl">Best 🏆</span>
+      </div>
+      <div class="stat">
+        <span class="sv" id="st-days">0/40</span>
+        <span class="sl">Days done</span>
+      </div>
+      <button class="btn-rst" onclick="resetAll()">↺ Reset</button>
+    </div>
+  </div>
+  <div class="bar-wrap"><div class="bar" id="main-bar" style="width:0%"></div></div>
+  <div class="bar-foot">
+    <span id="bar-pct">0% complete</span>
+    <span>40 study days total</span>
+  </div>
+</div>
+
+<div id="plan"></div>
+
+<p class="foot">The Mentalist · B1→B2 English Plan · Daniil × Olya</p>
+
+<script>
+'use strict';
+
+const GRAMMAR = [
+  'Present Perfect vs Past Simple',
+  'Present Perfect Continuous',
+  'Past Perfect &amp; Narrative Tenses',
+  'Conditionals 0 / 1 / 2',
+  'Conditional 3 + Mixed Conditionals',
+  'Articles — a / the / zero article',
+  'Dependent Prepositions + Phrasal Verbs',
+  'Reported Speech + Full Review',
+];
+
+const DAY_LABELS = ['Mon','Tue','Wed','Thu','Fri'];
+// d=0(Mon),2(Wed),4(Fri) → speaking; d=1(Tue),3(Thu) → grammar
+
+function tasks(w, d) {
+  const t = [
+    {id:'ep', lbl:'▶ Watch episode (EN subs)'},
+    {id:'ph', lbl:'✏️ Write 5 new phrases'},
+  ];
+  if (d % 2 === 0) {
+    t.push({id:'sp', lbl:'🗣 Speaking with Olya (30–60 min)'});
+  } else {
+    t.push({id:'gr', lbl:'📖 Grammar exercise'});
+  }
+  return t;
+}
+
+// ── Storage ──────────────────────────────────
+const SK = 'ep_v1';
+const load = () => { try { return JSON.parse(localStorage.getItem(SK) || '{}'); } catch { return {}; } };
+const save = d => localStorage.setItem(SK, JSON.stringify(d));
+const dk = (w, d) => `${w}:${d}`;
+
+// ── Logic ─────────────────────────────────────
+function isComplete(data, w, d) {
+  const ts = tasks(w, d);
+  return ts.every(t => data[dk(w,d)]?.tasks?.[t.id]);
+}
+
+function calcStats(data) {
+  const flags = [];
+  for (let w = 0; w < 8; w++)
+    for (let d = 0; d < 5; d++)
+      flags.push(isComplete(data, w, d));
+
+  const done = flags.filter(Boolean).length;
+  let cur = 0, i = flags.length - 1;
+  while (i >= 0 && flags[i]) { cur++; i--; }
+  let best = 0, run = 0;
+  for (const f of flags) { f ? (run++, best = Math.max(best, run)) : (run = 0); }
+  return { done, cur, best };
+}
+
+function updateStats() {
+  const data = load();
+  const { done, cur, best } = calcStats(data);
+
+  const curEl = document.getElementById('st-cur');
+  curEl.textContent = cur > 0 ? cur + '🔥' : cur;
+  document.getElementById('st-best').textContent = best;
+  document.getElementById('st-days').textContent = done + '/40';
+
+  const pct = Math.round(done / 40 * 100);
+  document.getElementById('main-bar').style.width = pct + '%';
+  document.getElementById('bar-pct').textContent = pct + '% complete';
+
+  for (let w = 0; w < 8; w++) {
+    let wd = 0;
+    for (let d = 0; d < 5; d++) {
+      const ok = isComplete(data, w, d);
+      document.getElementById(`c_${w}_${d}`)?.classList.toggle('done', ok);
+      if (ok) wd++;
+    }
+    const el = document.getElementById(`wp_${w}`);
+    if (el) el.textContent = wd + '/5';
+  }
+}
+
+function setTask(w, d, id, val) {
+  const data = load();
+  const k = dk(w, d);
+  if (!data[k]) data[k] = { tasks: {}, phrases: '' };
+  if (!data[k].tasks) data[k].tasks = {};
+  data[k].tasks[id] = val;
+  save(data);
+  updateStats();
+}
+
+function setPhrases(w, d, val) {
+  const data = load();
+  const k = dk(w, d);
+  if (!data[k]) data[k] = { tasks: {}, phrases: '' };
+  data[k].phrases = val;
+  save(data);
+}
+
+function resetAll() {
+  if (!confirm('Reset all progress? This cannot be undone.')) return;
+  localStorage.removeItem(SK);
+  build();
+}
+
+// ── Toggle phrases panel ──────────────────────
+function togglePhrases(btn) {
+  const pa = btn.nextElementSibling;
+  const open = pa.classList.toggle('open');
+  btn.classList.toggle('open', open);
+  btn.innerHTML = open ? '📝 My phrases ▴' : '📝 My phrases ▾';
+}
+
+// ── Build DOM ─────────────────────────────────
+function build() {
+  const data = load();
+  const root = document.getElementById('plan');
+  root.innerHTML = '';
+
+  for (let w = 0; w < 8; w++) {
+    let wd = 0;
+    for (let d = 0; d < 5; d++) if (isComplete(data, w, d)) wd++;
+
+    const sec = document.createElement('div');
+    sec.className = 'week';
+    sec.innerHTML =
+      `<div class="whdr">` +
+        `<span class="wnum">Week ${w + 1}</span>` +
+        `<span class="wtopic">${GRAMMAR[w]}</span>` +
+        `<span class="wprog" id="wp_${w}">${wd}/5</span>` +
+      `</div>` +
+      `<div class="wgrid" id="wg_${w}"></div>`;
+    root.appendChild(sec);
+
+    const grid = sec.querySelector(`#wg_${w}`);
+
+    for (let d = 0; d < 5; d++) {
+      const k = dk(w, d);
+      const saved = data[k] || { tasks: {}, phrases: '' };
+      const ts = tasks(w, d);
+      const done = ts.every(t => saved.tasks?.[t.id]);
+
+      const card = document.createElement('div');
+      card.className = 'dc' + (done ? ' done' : '');
+      card.id = `c_${w}_${d}`;
+
+      const tHTML = ts.map(t =>
+        `<li class="ti">` +
+          `<input type="checkbox" id="cb_${w}_${d}_${t.id}"` +
+            ` data-w="${w}" data-d="${d}" data-t="${t.id}"` +
+            (saved.tasks?.[t.id] ? ' checked' : '') + `>` +
+          `<label class="tlabel" for="cb_${w}_${d}_${t.id}">${t.lbl}</label>` +
+        `</li>`
+      ).join('');
+
+      const phEsc = (saved.phrases || '')
+        .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+
+      card.innerHTML =
+        `<div class="dname">${DAY_LABELS[d]}</div>` +
+        `<ul class="tlist">${tHTML}</ul>` +
+        `<button class="ptog" onclick="togglePhrases(this)">📝 My phrases ▾</button>` +
+        `<div class="pa">` +
+          `<textarea class="pta" data-w="${w}" data-d="${d}"` +
+            ` placeholder="1. …&#10;2. …&#10;3. …&#10;4. …&#10;5. …">${phEsc}</textarea>` +
+        `</div>`;
+
+      grid.appendChild(card);
+    }
+  }
+
+  // Attach listeners after DOM is built
+  root.querySelectorAll('.ti input[type=checkbox]').forEach(cb => {
+    cb.addEventListener('change', e => {
+      setTask(+e.target.dataset.w, +e.target.dataset.d, e.target.dataset.t, e.target.checked);
+    });
+  });
+
+  root.querySelectorAll('.pta').forEach(ta => {
+    ta.addEventListener('input', e => {
+      setPhrases(+e.target.dataset.w, +e.target.dataset.d, e.target.value);
+    });
+  });
+
+  updateStats();
+}
+
+build();
+</script>
+</body>
+</html>
